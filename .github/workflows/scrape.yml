@@ -1,0 +1,108 @@
+name: scrape-and-publish
+
+on:
+  schedule:
+    # Every 3 hours. Public-repo scheduled runs can be skipped under GitHub
+    # load; 3h cadence plus a 12h healthchecks.io grace absorbs typical skips.
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scrape-and-publish
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: python3 nvd.py
+
+      - name: Verify output looks sane
+        run: |
+          set -euo pipefail
+          test -f nvd.json
+          test -f nvd.jsonl
+          test -f metadata.json
+          bytes=$(stat -c %s nvd.json)
+          echo "nvd.json size: $bytes"
+          if [ "$bytes" -lt 100000000 ]; then
+            echo "nvd.json is suspiciously small ($bytes bytes) — aborting upload"
+            exit 1
+          fi
+          head -c 1 nvd.json | grep -q '\['
+          tail -c 1 nvd.json | grep -q '\]'
+
+      - name: Install rclone
+        uses: AnimMouse/setup-rclone@e4c00ff32b1b6f7034d23cfa5a3c05aebed6be53 # v1.11.0
+
+      - name: Configure rclone for R2
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        run: |
+          mkdir -p ~/.config/rclone
+          {
+            echo '[r2]'
+            echo 'type = s3'
+            echo 'provider = Cloudflare'
+            echo "access_key_id = $R2_ACCESS_KEY_ID"
+            echo "secret_access_key = $R2_SECRET_ACCESS_KEY"
+            echo "endpoint = https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+            echo 'acl = private'
+          } > ~/.config/rclone/rclone.conf
+
+      - name: Upload to R2
+        env:
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 \
+            --header-upload "Content-Type: application/json" \
+            --header-upload "Cache-Control: public, max-age=900" \
+            nvd.json "r2:$R2_BUCKET/nvd.json"
+          rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 \
+            --header-upload "Content-Type: application/json" \
+            --header-upload "Cache-Control: public, max-age=900" \
+            nvd.jsonl "r2:$R2_BUCKET/nvd.jsonl"
+          rclone copyto \
+            --header-upload "Content-Type: application/json" \
+            --header-upload "Cache-Control: no-cache" \
+            metadata.json "r2:$R2_BUCKET/metadata.json"
+
+      - name: Purge Cloudflare cache for nvd subdomain
+        env:
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          curl --fail -X POST \
+            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"files":["https://nvd.handsonhacking.org/nvd.json","https://nvd.handsonhacking.org/nvd.jsonl","https://nvd.handsonhacking.org/metadata.json"]}'
+
+      - name: Ping healthchecks.io
+        if: success()
+        env:
+          HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
+        run: curl --fail --retry 3 "$HEALTHCHECKS_PING_URL"
