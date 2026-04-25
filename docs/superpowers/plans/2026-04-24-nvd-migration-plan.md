@@ -122,7 +122,9 @@ Expected: JSON response with `"Status": "PENDING"`.
 
 - [ ] **Step 3: Record the timestamp**
 
-Note in the terminal when this was run. The earliest safe time to switch nameservers (Task 18) is 48 hours later. If executing this plan in a single sitting, **pause and come back Sunday evening** (≥48h after lowering TTL). If you already lowered the TTL days ago, proceed.
+Note in the terminal when this was run. The earliest safe time to switch nameservers (Task 11) is 48 hours later. If executing this plan in a single sitting, **pause and come back Sunday evening** (≥48h after lowering TTL). If you already lowered the TTL days ago, proceed.
+
+**Status (2026-04-24):** TTL verified as already 60s — no change needed. 48h-wait recommendation is mooted by the already-low TTL; cached entries everywhere expire within a minute.
 
 ---
 
