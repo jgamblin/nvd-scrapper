@@ -64,7 +64,7 @@ Retire the Cisco test-lab EC2 instance currently hosting `nvd.handsonhacking.org
 - **GitHub repo `nvd-scrapper` (public).** Holds `nvd.py`, `.github/workflows/scrape.yml`, `README.md` (with Actions status badge and healthchecks badge), and this design doc.
 - **GitHub Actions workflow.** Cron every 3h plus `workflow_dispatch`. Runs on `ubuntu-latest`. Reads secrets, executes scrape, uploads to R2, purges Cloudflare cache, pings healthchecks.io.
 - **Cloudflare R2 bucket `nvd-handsonhacking`.** Holds `nvd.json` and `nvd.jsonl`. Public access via custom domain binding. No Worker required for current requirements.
-- **Cloudflare DNS.** `handsonhacking.org` moves from Route 53 to Cloudflare (nameserver change at Namecheap). `nvd` subdomain bound to R2 via Cloudflare's native R2 custom domain feature.
+- **Cloudflare DNS.** `handsonhacking.org` moves from Route 53 to Cloudflare (nameserver change at Namecheap). `nvd` subdomain bound to R2 via Cloudflare's native R2 custom domain feature. Cloudflare's free plan also gives unlimited DNS records + automatic TLS for any future `*.handsonhacking.org` test subdomains.
 - **healthchecks.io.** Free tier. End-of-workflow ping with 12-hour grace period; alerts via email/Discord if no ping arrives.
 
 ## 4. Data Flow and Behavior
@@ -101,10 +101,16 @@ Executed in order. Each step is verifiable before moving to the next.
 **Phase A — Prepare (no user-visible changes)**
 
 1. **Rotate NVD API key.** Request a new key from the NVD dashboard. Old key stays on EC2 and keeps working.
-2. **Lower Route 53 TTLs to 300s** for all records. Wait 48h before any NS change.
-3. **Inventory Route 53.** `aws route53 list-resource-record-sets --hosted-zone-id ...`. Save the full record list. Confirm with user what non-`nvd` records exist (MX, SPF/DKIM/DMARC, other subdomains).
-4. **Create Cloudflare account** (if none). Add `handsonhacking.org` as a site. Let Cloudflare scan Route 53 and import records.
-5. **Reconcile records.** Diff Cloudflare's imported set against the Route 53 inventory. Manually recreate anything missed. Do NOT proceed until every record is verified in the Cloudflare dashboard.
+2. **Lower `nvd.handsonhacking.org` TTL to 300s.** Wait 48h before any NS change. (Other records are being retired with the Cisco exit — no need to lower their TTLs.)
+3. **Route 53 inventory (captured 2026-04-24, zone `Z04136603CFU3JHJ2BNR4`):**
+   - `nvd.handsonhacking.org` A → `3.143.74.225` — **migrating**
+   - `morpheus.handsonhacking.org` ALIAS → Cisco ELB — **retiring with Cisco exit**
+   - `riskscore.handsonhacking.org` ALIAS → Cisco ELB — **retiring with Cisco exit**
+   - `splunk.handsonhacking.org` A → `3.136.130.141` — **retiring with Cisco exit**
+   - Two ACM validation CNAMEs for morpheus/riskscore certs — **retiring with ELBs**
+   - No MX, no SPF/DKIM/DMARC, no email on the domain.
+4. **Create Cloudflare account** (if none). Add `handsonhacking.org` as a site. Cloudflare's scan will import the records above; we will prune everything except `nvd.` in the next step.
+5. **Prune imported records.** In Cloudflare DNS, delete the `morpheus`, `riskscore`, `splunk`, and ACM-validation records. Keep only `nvd.handsonhacking.org` A record pointing to `3.143.74.225` (this stays until step 12 binds the subdomain to R2 via the custom-domain feature, at which point Cloudflare manages the record automatically).
 6. **Create R2 bucket** `nvd-handsonhacking`. Generate an R2 API token scoped to write access on that bucket.
 7. **Refactor `nvd.py`** to read `NVD_API_KEY` from env and write the JSON array incrementally (streaming).
 8. **Write `.github/workflows/scrape.yml`** with cron, secrets, rclone upload, cache purge, healthchecks ping.
@@ -163,13 +169,12 @@ Effective cost is zero-ish. Even if consumer traffic is 10× my estimate, total 
 
 ## 10. Risks and Open Questions
 
-| Risk                                                                                      | Mitigation / Open question                                                                                                     |
-| ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| DNS migration breaks email (MX/SPF/DKIM/DMARC)                                            | Record inventory (step 3) is the gate. User confirms what email, if any, is on `handsonhacking.org`.                           |
-| Route 53 → Cloudflare nameserver change takes longer than 48h to propagate                | Keep Route 53 zone live 2 weeks post-switch. Lower TTLs 48h ahead.                                                             |
-| Some consumer expected the exact byte-for-byte JSON array shape of `nvd.jsonl`            | Keeping `.jsonl` file as a JSON array preserves compatibility. Reconsider true JSONL only after confirming no consumer breaks. |
-| NVD API adds new rate-limiting or auth requirements                                       | Out of scope; would need a fix in the scraper regardless of hosting.                                                           |
-| **Open question:** does `handsonhacking.org` host email or other services besides `nvd.`? | User to confirm before step 3. If yes, step 3's inventory becomes load-bearing.                                                |
+| Risk                                                                           | Mitigation                                                                                                                     |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| Route 53 → Cloudflare nameserver change takes longer than 48h to propagate     | Keep Route 53 zone live 2 weeks post-switch. Lower `nvd` TTL 48h ahead.                                                        |
+| Some consumer expected the exact byte-for-byte JSON array shape of `nvd.jsonl` | Keeping `.jsonl` file as a JSON array preserves compatibility. Reconsider true JSONL only after confirming no consumer breaks. |
+| NVD API adds new rate-limiting or auth requirements                            | Out of scope; would need a fix in the scraper regardless of hosting.                                                           |
+| Cisco ELBs behind `morpheus` / `riskscore` / `splunk` disappear mid-migration  | These records are intentionally retired in Phase A step 5. No mitigation needed — they are expected to go dark.                |
 
 ## 11. Out of Scope (Explicit)
 
