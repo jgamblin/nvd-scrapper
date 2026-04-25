@@ -17,3 +17,7 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Local secrets (never committed — these live in GitHub repo secrets)
+.env
+.env.local
