@@ -31,19 +31,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Diagnose env var shape (debug)
-        env:
-          NVD_PROXY_URL: ${{ secrets.NVD_PROXY_URL }}
-          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
-        run: |
-          echo "NVD_PROXY_URL length: ${#NVD_PROXY_URL}"
-          echo "NVD_PROXY_URL first char codepoint: $(printf %d "'${NVD_PROXY_URL:0:1}")"
-          echo "NVD_PROXY_URL starts with https: $([[ "$NVD_PROXY_URL" == https://* ]] && echo YES || echo NO)"
-          echo "PROXY_TOKEN length: ${#PROXY_TOKEN}"
-
       - name: Run scraper
         env:
-          NVD_PROXY_URL: ${{ secrets.NVD_PROXY_URL }}
+          NVD_PROXY_URL: https://nvd-proxy.handsonhacking.workers.dev
           PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
         run: python3 nvd.py
