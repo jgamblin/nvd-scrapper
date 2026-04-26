@@ -90,6 +90,10 @@ jobs:
             --header-upload "Content-Type: application/json" \
             --header-upload "Cache-Control: no-cache" \
             metadata.json "r2:$R2_BUCKET/metadata.json"
+          rclone copyto --s3-no-check-bucket \
+            --header-upload "Content-Type: text/html; charset=utf-8" \
+            --header-upload "Cache-Control: public, max-age=300" \
+            index.html "r2:$R2_BUCKET/index.html"
 
       - name: Purge Cloudflare cache for nvd subdomain
         env:
@@ -100,7 +104,7 @@ jobs:
             "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --data '{"files":["https://nvd.handsonhacking.org/nvd.json","https://nvd.handsonhacking.org/nvd.jsonl","https://nvd.handsonhacking.org/metadata.json"]}'
+            --data '{"files":["https://nvd.handsonhacking.org/","https://nvd.handsonhacking.org/index.html","https://nvd.handsonhacking.org/nvd.json","https://nvd.handsonhacking.org/nvd.jsonl","https://nvd.handsonhacking.org/metadata.json"]}'
 
       - name: Ping healthchecks.io
         if: success()
