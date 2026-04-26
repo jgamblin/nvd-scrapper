@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
+NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
 PAGE_SIZE = 2000
 MAX_RETRIES_PER_PAGE = 5
 RETRY_BACKOFF_SECONDS = 15
@@ -27,42 +27,39 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 log = logging.getLogger("nvd")
 
 
-def build_session(api_key: str) -> requests.Session:
+def build_session() -> requests.Session:
     session = requests.Session()
     retries = Retry(total=5, backoff_factor=1, status_forcelist=[502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retries))
-    session.headers.update(
-        {
-            "apiKey": api_key,
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/58.0.3029.110 Safari/537.3"
-            ),
-        }
-    )
     return session
 
 
-def fetch_total(session: requests.Session) -> int:
-    resp = session.get(
-        NVD_URL, params={"startIndex": 0, "resultsPerPage": 1}, timeout=REQUEST_TIMEOUT
-    )
+def build_headers(api_key: str) -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/58.0.3029.110 Safari/537.3"
+        ),
+        "apiKey": api_key,
+    }
+
+
+def fetch_total(session: requests.Session, headers: dict) -> int:
+    url = f"{NVD_BASE}?startIndex=0&resultsPerPage=1"
+    resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return int(resp.json().get("totalResults", 0))
 
 
-def iter_pages(session: requests.Session, total: int):
+def iter_pages(session: requests.Session, headers: dict, total: int):
     """Yield lists of vulnerability dicts, one list per API page."""
     start = 0
     while start < total:
+        url = f"{NVD_BASE}?resultsPerPage={PAGE_SIZE}&startIndex={start}"
         for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
             try:
-                resp = session.get(
-                    NVD_URL,
-                    params={"startIndex": start, "resultsPerPage": PAGE_SIZE},
-                    timeout=REQUEST_TIMEOUT,
-                )
+                resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
                 resp.raise_for_status()
                 vulns = resp.json().get("vulnerabilities", [])
                 log.info("Fetched page start=%s size=%s", start, len(vulns))
@@ -120,11 +117,12 @@ def main() -> int:
         log.error("NVD_API_KEY is not set")
         return 2
 
-    session = build_session(api_key)
+    session = build_session()
+    headers = build_headers(api_key)
     started_at = datetime.now(timezone.utc)
 
     try:
-        total = fetch_total(session)
+        total = fetch_total(session, headers)
     except requests.RequestException as exc:
         log.error("Failed to fetch total CVE count: %s", exc)
         return 3
@@ -137,7 +135,7 @@ def main() -> int:
 
     log.info("NVD reports %s total CVEs", total)
 
-    cve_count = write_stream(iter_pages(session, total), "nvd.json")
+    cve_count = write_stream(iter_pages(session, headers, total), "nvd.json")
 
     if cve_count == 0:
         log.error("Scrape produced 0 CVEs but total was %s — aborting", total)
