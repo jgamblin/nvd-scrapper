@@ -78,15 +78,15 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           set -euo pipefail
-          rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 \
+          rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 --s3-no-check-bucket \
             --header-upload "Content-Type: application/json" \
             --header-upload "Cache-Control: public, max-age=900" \
             nvd.json "r2:$R2_BUCKET/nvd.json"
-          rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 \
+          rclone copyto --s3-chunk-size 64M --s3-upload-concurrency 4 --s3-no-check-bucket \
             --header-upload "Content-Type: application/json" \
             --header-upload "Cache-Control: public, max-age=900" \
             nvd.jsonl "r2:$R2_BUCKET/nvd.jsonl"
-          rclone copyto \
+          rclone copyto --s3-no-check-bucket \
             --header-upload "Content-Type: application/json" \
             --header-upload "Cache-Control: no-cache" \
             metadata.json "r2:$R2_BUCKET/metadata.json"
