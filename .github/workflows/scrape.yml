@@ -53,7 +53,7 @@ jobs:
           tail -c 1 nvd.json | grep -q '\]'
 
       - name: Install rclone
-        uses: AnimMouse/setup-rclone@e4c00ff32b1b6f7034d23cfa5a3c05aebed6be53 # v1.11.0
+        uses: AnimMouse/setup-rclone@0d99fa3878a334d3e307c1a8372ad55550fdaea7 # v1.11.0
 
       - name: Configure rclone for R2
         env:
