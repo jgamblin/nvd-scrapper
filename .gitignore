@@ -21,3 +21,6 @@ venv/
 # Local secrets (never committed — these live in GitHub repo secrets)
 .env
 .env.local
+
+# Claude Code local state
+.claude/

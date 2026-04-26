@@ -43,9 +43,18 @@ export default {
       return new Response("method not allowed", { status: 405 });
     }
 
-    // Rebuild the URL against NVD's origin, preserving path and query
+    // Rebuild the URL against NVD's origin, preserving path and query.
+    // Only paths under /rest/ are forwarded; anything else is refused
+    // so a valid-token caller cannot coerce the base-URL resolver into
+    // a different host via a `//attacker.tld/...` path.
     const incoming = new URL(request.url);
+    if (!incoming.pathname.startsWith("/rest/")) {
+      return new Response("not found", { status: 404 });
+    }
     const target = new URL(incoming.pathname + incoming.search, NVD_ORIGIN);
+    if (target.host !== "services.nvd.nist.gov") {
+      return new Response("forbidden", { status: 403 });
+    }
 
     const upstream = await fetch(target.toString(), {
       method: "GET",
