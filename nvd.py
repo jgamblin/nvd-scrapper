@@ -1,12 +1,8 @@
-"""NVD CVE scraper — streams the full dataset to disk via a Cloudflare Worker proxy.
+"""NVD CVE scraper — streams the full dataset to disk.
 
-NVD's WAF rejects GitHub Actions runner IPs. The scraper talks to a
-Worker at $NVD_PROXY_URL which holds the real NVD API key and forwards
-the request from a trusted egress IP. The scraper authenticates to the
-Worker with a shared $PROXY_TOKEN.
-
-Writes `nvd.json` (JSON array) and `nvd.jsonl` (byte-identical copy for
-consumer compatibility). Also writes `metadata.json` with run stats.
+Reads `NVD_API_KEY` from the environment. Writes a JSON array to
+`nvd.json` (and a byte-identical copy to `nvd.jsonl` for consumer
+compatibility). Also writes `metadata.json` with run statistics.
 """
 
 import json
@@ -20,7 +16,7 @@ from datetime import datetime, timezone
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
-NVD_PATH = "rest/json/cves/2.0/"
+NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
 PAGE_SIZE = 2000
 MAX_RETRIES_PER_PAGE = 5
 RETRY_BACKOFF_SECONDS = 15
@@ -37,29 +33,29 @@ def build_session() -> requests.Session:
     return session
 
 
-def build_headers(proxy_token: str) -> dict:
+def build_headers(api_key: str) -> dict:
     return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/58.0.3029.110 Safari/537.3"
         ),
-        "X-Proxy-Token": proxy_token,
+        "apiKey": api_key,
     }
 
 
-def fetch_total(session: requests.Session, base: str, headers: dict) -> int:
-    url = f"{base.rstrip('/')}/{NVD_PATH}?startIndex=0&resultsPerPage=1"
+def fetch_total(session: requests.Session, headers: dict) -> int:
+    url = f"{NVD_BASE}?startIndex=0&resultsPerPage=1"
     resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return int(resp.json().get("totalResults", 0))
 
 
-def iter_pages(session: requests.Session, base: str, headers: dict, total: int):
+def iter_pages(session: requests.Session, headers: dict, total: int):
     """Yield lists of vulnerability dicts, one list per API page."""
     start = 0
     while start < total:
-        url = f"{base.rstrip('/')}/{NVD_PATH}?resultsPerPage={PAGE_SIZE}&startIndex={start}"
+        url = f"{NVD_BASE}?resultsPerPage={PAGE_SIZE}&startIndex={start}"
         for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
             try:
                 resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -115,21 +111,17 @@ def write_metadata(
 
 
 def main() -> int:
-    proxy_url = os.environ.get("NVD_PROXY_URL")
-    proxy_token = os.environ.get("PROXY_TOKEN")
-    if not proxy_url:
-        log.error("NVD_PROXY_URL is not set")
-        return 2
-    if not proxy_token:
-        log.error("PROXY_TOKEN is not set")
+    api_key = os.environ.get("NVD_API_KEY")
+    if not api_key:
+        log.error("NVD_API_KEY is not set")
         return 2
 
     session = build_session()
-    headers = build_headers(proxy_token)
+    headers = build_headers(api_key)
     started_at = datetime.now(timezone.utc)
 
     try:
-        total = fetch_total(session, proxy_url, headers)
+        total = fetch_total(session, headers)
     except requests.RequestException as exc:
         log.error("Failed to fetch total CVE count: %s", exc)
         return 3
@@ -142,7 +134,7 @@ def main() -> int:
 
     log.info("NVD reports %s total CVEs", total)
 
-    cve_count = write_stream(iter_pages(session, proxy_url, headers, total), "nvd.json")
+    cve_count = write_stream(iter_pages(session, headers, total), "nvd.json")
 
     if cve_count == 0:
         log.error("Scrape produced 0 CVEs but total was %s — aborting", total)

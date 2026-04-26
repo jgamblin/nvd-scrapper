@@ -33,8 +33,7 @@ jobs:
 
       - name: Run scraper
         env:
-          NVD_PROXY_URL: https://nvd-proxy.handsonhacking.workers.dev
-          PROXY_TOKEN: ${{ secrets.PROXY_TOKEN }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
           GITHUB_SHA: ${{ github.sha }}
         run: python3 nvd.py
 
