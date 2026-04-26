@@ -34,7 +34,11 @@ def build_session(api_key: str) -> requests.Session:
     session.headers.update(
         {
             "apiKey": api_key,
-            "User-Agent": "nvd-scrapper/1.0 (+https://github.com/jgamblin/nvd-scrapper)",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/58.0.3029.110 Safari/537.3"
+            ),
         }
     )
     return session
