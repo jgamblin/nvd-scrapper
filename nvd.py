@@ -16,6 +16,7 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 
 import requests
+import urllib3.exceptions
 
 NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
 NVD_FEED_BASE = "https://nvd.nist.gov/feeds/json/cve/2.0"
@@ -87,7 +88,7 @@ def fetch_feed(session: requests.Session, year: int):
             vulnerabilities = payload.get("vulnerabilities", [])
             log.info("Fetched feed year=%s size=%s", year, len(vulnerabilities))
             return vulnerabilities
-        except (OSError, requests.RequestException, ValueError) as exc:
+        except (OSError, requests.RequestException, ValueError, urllib3.exceptions.HTTPError) as exc:
             if attempt == MAX_RETRIES_PER_PAGE:
                 raise RuntimeError(
                     f"Failed to fetch feed year={year} after {MAX_RETRIES_PER_PAGE} attempts"
@@ -159,7 +160,7 @@ def iter_pages(
                 yield vulns
                 page_ok = True
                 break
-            except (requests.RequestException, ValueError) as exc:
+            except (requests.RequestException, ValueError, urllib3.exceptions.HTTPError) as exc:
                 if attempt == MAX_RETRIES_PER_PAGE:
                     raise RuntimeError(
                         f"Failed to fetch page startIndex={start} after "
@@ -224,7 +225,7 @@ def iter_modified_pages(
                 yield vulns
                 page_ok = True
                 break
-            except (requests.RequestException, ValueError) as exc:
+            except (requests.RequestException, ValueError, urllib3.exceptions.HTTPError) as exc:
                 if attempt == MAX_RETRIES_PER_PAGE:
                     raise RuntimeError(
                         f"Failed to fetch modified page startIndex={start} after "
