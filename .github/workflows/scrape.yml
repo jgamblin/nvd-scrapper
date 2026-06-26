@@ -17,7 +17,12 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
+    # Retry once on transient failures (NIST outages, runner hiccups).
+    # Second attempt re-runs from scratch; the scraper is idempotent.
+    strategy:
+      max-attempts: 2
+      fail-fast: true
     steps:
       - name: Check out repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
