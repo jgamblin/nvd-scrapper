@@ -19,7 +19,7 @@ import requests
 import urllib3.exceptions
 
 NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
-NVD_FEED_BASE = "https://nvd.nist.gov/feeds/json/cve/2.0"
+NVD_FEED_BASE = "https://static.nvd.nist.gov/feeds/json/cve/2.0"
 PAGE_SIZE = 2000
 MAX_RETRIES_PER_PAGE = 5
 RETRY_BACKOFF_SECONDS = 15
