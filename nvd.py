@@ -22,7 +22,7 @@ NVD_FEED_BASE = "https://nvd.nist.gov/feeds/json/cve/2.0"
 PAGE_SIZE = 2000
 MAX_RETRIES_PER_PAGE = 5
 RETRY_BACKOFF_SECONDS = 15
-REQUEST_TIMEOUT = 60
+REQUEST_TIMEOUT = 300
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("nvd")
