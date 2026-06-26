@@ -11,12 +11,14 @@ import os
 import shutil
 import sys
 import time
+import gzip
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
 NVD_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0/"
+NVD_FEED_BASE = "https://nvd.nist.gov/feeds/json/cve/2.0"
 PAGE_SIZE = 2000
 MAX_RETRIES_PER_PAGE = 5
 RETRY_BACKOFF_SECONDS = 15
@@ -46,6 +48,80 @@ def fetch_total(session: requests.Session, headers: dict) -> int:
     resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return int(resp.json().get("totalResults", 0))
+
+
+def iter_feed_years(start_year: int = 2002, end_year: int | None = None):
+    if end_year is None:
+        end_year = datetime.now(timezone.utc).year
+
+    for year in range(start_year, end_year + 1):
+        yield year
+
+
+def feed_url_for_year(year: int) -> str:
+    return f"{NVD_FEED_BASE}/nvdcve-2.0-{year}.json.gz"
+
+
+def cve_id_for_item(item: dict) -> str:
+    return item["cve"]["id"]
+
+
+def format_api_datetime(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def fetch_feed(session: requests.Session, year: int):
+    url = feed_url_for_year(year)
+    log.info("Fetching feed year=%s", year)
+
+    for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
+        try:
+            with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
+                resp.raise_for_status()
+                resp.raw.decode_content = False
+                with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
+                    payload = json.load(gz_stream)
+
+            vulnerabilities = payload.get("vulnerabilities", [])
+            log.info("Fetched feed year=%s size=%s", year, len(vulnerabilities))
+            return vulnerabilities
+        except (OSError, requests.RequestException, ValueError) as exc:
+            if attempt == MAX_RETRIES_PER_PAGE:
+                raise RuntimeError(
+                    f"Failed to fetch feed year={year} after {MAX_RETRIES_PER_PAGE} attempts"
+                ) from exc
+
+            delay = _retry_delay_seconds(exc, attempt)
+            log.warning(
+                "Feed year=%s attempt %s/%s failed: %s; retrying in %.1fs",
+                year,
+                attempt,
+                MAX_RETRIES_PER_PAGE,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+
+def iter_feeds(
+    session: requests.Session,
+    start_year: int,
+    end_year: int,
+    override_ids: set[str] | None = None,
+    request_delay_seconds: float = 0.0,
+):
+    override_ids = override_ids or set()
+    years = list(iter_feed_years(start_year, end_year))
+    for index, year in enumerate(years):
+        page = fetch_feed(session, year)
+        if override_ids:
+            page = [item for item in page if cve_id_for_item(item) not in override_ids]
+        yield page
+
+        if request_delay_seconds > 0 and index < len(years) - 1:
+            time.sleep(request_delay_seconds)
 
 
 def _retry_delay_seconds(exc: Exception, attempt: int) -> float:
@@ -110,6 +186,119 @@ def iter_pages(
         start += PAGE_SIZE
 
 
+def iter_modified_pages(
+    session: requests.Session,
+    headers: dict,
+    last_mod_start: datetime,
+    last_mod_end: datetime,
+    request_delay_seconds: float = 0.0,
+):
+    params = {
+        "resultsPerPage": PAGE_SIZE,
+        "lastModStartDate": format_api_datetime(last_mod_start),
+        "lastModEndDate": format_api_datetime(last_mod_end),
+    }
+    start = 0
+    total = None
+
+    while total is None or start < total:
+        page_ok = False
+        for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
+            try:
+                resp = session.get(
+                    NVD_BASE,
+                    headers=headers,
+                    params={**params, "startIndex": start},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                total = int(payload.get("totalResults", 0))
+                vulns = payload.get("vulnerabilities", [])
+                log.info(
+                    "Fetched modified page start=%s size=%s total=%s",
+                    start,
+                    len(vulns),
+                    total,
+                )
+                yield vulns
+                page_ok = True
+                break
+            except (requests.RequestException, ValueError) as exc:
+                if attempt == MAX_RETRIES_PER_PAGE:
+                    raise RuntimeError(
+                        f"Failed to fetch modified page startIndex={start} after "
+                        f"{MAX_RETRIES_PER_PAGE} attempts"
+                    ) from exc
+
+                delay = _retry_delay_seconds(exc, attempt)
+                log.warning(
+                    "Modified page start=%s attempt %s/%s failed: %s; retrying in %.1fs",
+                    start,
+                    attempt,
+                    MAX_RETRIES_PER_PAGE,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+
+        if not page_ok:
+            raise RuntimeError(
+                f"Modified page fetch failed without success for startIndex={start}"
+            )
+
+        if total == 0:
+            break
+
+        start += PAGE_SIZE
+
+        if request_delay_seconds > 0 and start < total:
+            time.sleep(request_delay_seconds)
+
+
+def fetch_modified_overrides(
+    session: requests.Session,
+    headers: dict,
+    last_mod_start: datetime,
+    last_mod_end: datetime,
+    request_delay_seconds: float = 0.0,
+) -> dict[str, dict]:
+    overrides = {}
+    for page in iter_modified_pages(
+        session,
+        headers,
+        last_mod_start,
+        last_mod_end,
+        request_delay_seconds=request_delay_seconds,
+    ):
+        for item in page:
+            overrides[cve_id_for_item(item)] = item
+
+    log.info("Fetched %s API override CVEs", len(overrides))
+    return overrides
+
+
+def iter_all_pages(
+    session: requests.Session,
+    start_year: int,
+    end_year: int,
+    overrides: dict[str, dict],
+    request_delay_seconds: float = 0.0,
+):
+    override_ids = set(overrides)
+
+    yield from iter_feeds(
+        session,
+        start_year,
+        end_year,
+        override_ids=override_ids,
+        request_delay_seconds=request_delay_seconds,
+    )
+
+    if overrides:
+        yield list(overrides.values())
+
+
 def write_stream(pages, out_path: str) -> int:
     """Stream an iterator of page-lists into a JSON array file. Returns the total CVE count."""
     count = 0
@@ -141,43 +330,59 @@ def write_metadata(
 
 
 def main() -> int:
-    api_key = os.environ.get("NVD_API_KEY")
-    if not api_key:
-        log.error("NVD_API_KEY is not set")
-        return 2
-
     session = build_session()
-    headers = build_headers(api_key)
     started_at = datetime.now(timezone.utc)
-
-    try:
-        total = fetch_total(session, headers)
-    except requests.RequestException as exc:
-        log.error("Failed to fetch total CVE count: %s", exc)
-        return 3
-
-    if total == 0:
-        log.error(
-            "NVD returned totalResults=0 — aborting to avoid publishing an empty file"
-        )
-        return 4
-
-    log.info("NVD reports %s total CVEs", total)
+    api_key = os.environ.get("NVD_API_KEY")
 
     request_delay_seconds = float(os.environ.get("NVD_REQUEST_DELAY_SECONDS", "0"))
+    start_year = int(os.environ.get("NVD_FEED_START_YEAR", "2002"))
+    end_year = int(
+        os.environ.get("NVD_FEED_END_YEAR", str(datetime.now(timezone.utc).year))
+    )
+    include_api_delta = os.environ.get("NVD_INCLUDE_API_DELTA", "1") != "0"
+    delta_window_hours = int(os.environ.get("NVD_API_DELTA_WINDOW_HOURS", "48"))
+
+    if start_year > end_year:
+        log.error("Invalid feed year range: %s > %s", start_year, end_year)
+        return 2
+
+    log.info("Fetching NVD feeds for years %s-%s", start_year, end_year)
 
     try:
+        overrides = {}
+        if include_api_delta:
+            delta_end = datetime.now(timezone.utc)
+            delta_start = delta_end - timedelta(hours=delta_window_hours)
+            log.info(
+                "Fetching API delta for last-modified window %s to %s",
+                format_api_datetime(delta_start),
+                format_api_datetime(delta_end),
+            )
+            overrides = fetch_modified_overrides(
+                session,
+                build_headers(api_key) if api_key else {},
+                delta_start,
+                delta_end,
+                request_delay_seconds=request_delay_seconds,
+            )
+
         cve_count = write_stream(
-            iter_pages(session, headers, total, request_delay_seconds=request_delay_seconds),
+            iter_all_pages(
+                session,
+                start_year,
+                end_year,
+                overrides,
+                request_delay_seconds=request_delay_seconds,
+            ),
             "nvd.json",
         )
     except RuntimeError as exc:
         log.error("Scrape failed before completion: %s", exc)
-        return 6
+        return 3
 
     if cve_count == 0:
-        log.error("Scrape produced 0 CVEs but total was %s — aborting", total)
-        return 5
+        log.error("Scrape produced 0 CVEs — aborting")
+        return 4
 
     # Duplicate for consumer compatibility (see design §4)
     shutil.copyfile("nvd.json", "nvd.jsonl")

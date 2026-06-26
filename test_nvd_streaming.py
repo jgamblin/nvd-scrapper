@@ -8,6 +8,7 @@ asserts the output is valid JSON containing every item.
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from unittest.mock import Mock
 
 import nvd
@@ -94,3 +95,34 @@ def test_iter_pages_raises_when_retries_exhausted(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Failed to fetch page"):
         list(nvd.iter_pages(session, {}, total=1))
+
+
+def test_format_api_datetime_uses_z_suffix():
+    value = datetime(2026, 6, 26, 12, 34, 56, 789000, tzinfo=timezone.utc)
+
+    assert nvd.format_api_datetime(value) == "2026-06-26T12:34:56.789Z"
+
+
+def test_iter_all_pages_replaces_overridden_cves(monkeypatch):
+    monkeypatch.setattr(
+        nvd,
+        "fetch_feed",
+        lambda session, year: [
+            {"cve": {"id": f"CVE-{year}-0001"}},
+            {"cve": {"id": f"CVE-{year}-0002"}},
+        ],
+    )
+
+    overrides = {
+        "CVE-2002-0002": {"cve": {"id": "CVE-2002-0002", "lastModified": "new"}},
+        "CVE-2025-9999": {"cve": {"id": "CVE-2025-9999"}},
+    }
+
+    pages = list(nvd.iter_all_pages(Mock(), 2002, 2003, overrides))
+
+    assert pages[0] == [{"cve": {"id": "CVE-2002-0001"}}]
+    assert pages[1] == [
+        {"cve": {"id": "CVE-2003-0001"}},
+        {"cve": {"id": "CVE-2003-0002"}},
+    ]
+    assert pages[2] == list(overrides.values())
