@@ -18,7 +18,10 @@ from datetime import datetime, timezone
 import requests
 import urllib3.exceptions
 
-NVD_FEED_BASE = "https://static.nvd.nist.gov/feeds/json/cve/2.0"
+NVD_FEED_BASES = [
+    "https://static.nvd.nist.gov/feeds/json/cve/2.0",
+    "https://nvd.nist.gov/feeds/json/cve/2.0",
+]
 PAGE_SIZE = 2000
 MAX_RETRIES_PER_PAGE = 5
 RETRY_BACKOFF_SECONDS = 15
@@ -44,7 +47,7 @@ def build_headers(api_key: str) -> dict:
 
 
 def fetch_total(session: requests.Session, headers: dict) -> int:
-    url = f"{NVD_API_BASES[0]}?startIndex=0&resultsPerPage=1"
+    url = "https://services.nvd.nist.gov/rest/json/cves/2.0/?startIndex=0&resultsPerPage=1"
     resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return int(resp.json().get("totalResults", 0))
@@ -58,87 +61,77 @@ def iter_feed_years(start_year: int = 2002, end_year: int | None = None):
         yield year
 
 
-def feed_url_for_year(year: int) -> str:
-    return f"{NVD_FEED_BASE}/nvdcve-2.0-{year}.json.gz"
+def feed_urls_for_year(year: int) -> list[str]:
+    return [f"{base}/nvdcve-2.0-{year}.json.gz" for base in NVD_FEED_BASES]
 
 
-def modified_feed_url() -> str:
-    return f"{NVD_FEED_BASE}/nvdcve-2.0-modified.json.gz"
+def modified_feed_urls() -> list[str]:
+    return [f"{base}/nvdcve-2.0-modified.json.gz" for base in NVD_FEED_BASES]
 
 
 def cve_id_for_item(item: dict) -> str:
     return item["cve"]["id"]
 
 
-def fetch_feed(session: requests.Session, year: int):
-    url = feed_url_for_year(year)
-    log.info("Fetching feed year=%s", year)
+def _load_gzip_json_from_urls(
+    session: requests.Session,
+    urls: list[str],
+    label: str,
+) -> dict:
+    last_exc = None
 
     for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
-        try:
-            with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
-                resp.raise_for_status()
-                resp.raw.decode_content = False
-                with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
-                    payload = json.load(gz_stream)
+        for url in urls:
+            try:
+                with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
+                    resp.raise_for_status()
+                    resp.raw.decode_content = False
+                    with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
+                        return json.load(gz_stream)
+            except (
+                OSError,
+                requests.RequestException,
+                ValueError,
+                urllib3.exceptions.HTTPError,
+            ) as exc:
+                last_exc = exc
+                log.warning(
+                    "%s host failed on attempt %s/%s: %s (%s)",
+                    label,
+                    attempt,
+                    MAX_RETRIES_PER_PAGE,
+                    url,
+                    exc,
+                )
 
-            vulnerabilities = payload.get("vulnerabilities", [])
-            log.info("Fetched feed year=%s size=%s", year, len(vulnerabilities))
-            return vulnerabilities
-        except (OSError, requests.RequestException, ValueError, urllib3.exceptions.HTTPError) as exc:
-            if attempt == MAX_RETRIES_PER_PAGE:
-                raise RuntimeError(
-                    f"Failed to fetch feed year={year} after {MAX_RETRIES_PER_PAGE} attempts"
-                ) from exc
+        if attempt == MAX_RETRIES_PER_PAGE:
+            break
 
-            delay = _retry_delay_seconds(exc, attempt)
-            log.warning(
-                "Feed year=%s attempt %s/%s failed: %s; retrying in %.1fs",
-                year,
-                attempt,
-                MAX_RETRIES_PER_PAGE,
-                exc,
-                delay,
-            )
-            time.sleep(delay)
+        delay = _retry_delay_seconds(last_exc, attempt)
+        log.warning("%s retrying all hosts in %.1fs", label, delay)
+        time.sleep(delay)
+
+    raise RuntimeError(
+        f"Failed to fetch {label} after {MAX_RETRIES_PER_PAGE} attempts"
+    ) from last_exc
+
+
+def fetch_feed(session: requests.Session, year: int):
+    urls = feed_urls_for_year(year)
+    log.info("Fetching feed year=%s", year)
+    payload = _load_gzip_json_from_urls(session, urls, f"feed year={year}")
+    vulnerabilities = payload.get("vulnerabilities", [])
+    log.info("Fetched feed year=%s size=%s", year, len(vulnerabilities))
+    return vulnerabilities
 
 
 def fetch_modified_feed(session: requests.Session) -> list[dict]:
-    url = modified_feed_url()
+    urls = modified_feed_urls()
     log.info("Fetching modified feed snapshot")
-
-    for attempt in range(1, MAX_RETRIES_PER_PAGE + 1):
-        try:
-            with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
-                resp.raise_for_status()
-                resp.raw.decode_content = False
-                with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
-                    payload = json.load(gz_stream)
-
-            vulnerabilities = payload.get("vulnerabilities", [])
-            log.info("Fetched modified feed size=%s", len(vulnerabilities))
-            return vulnerabilities
-        except (
-            OSError,
-            requests.RequestException,
-            ValueError,
-            urllib3.exceptions.HTTPError,
-        ) as exc:
-            if attempt == MAX_RETRIES_PER_PAGE:
-                raise RuntimeError(
-                    "Failed to fetch modified feed after "
-                    f"{MAX_RETRIES_PER_PAGE} attempts"
-                ) from exc
-
-            delay = _retry_delay_seconds(exc, attempt)
-            log.warning(
-                "Modified feed attempt %s/%s failed: %s; retrying in %.1fs",
-                attempt,
-                MAX_RETRIES_PER_PAGE,
-                exc,
-                delay,
-            )
-            time.sleep(delay)
+    payload = _load_gzip_json_from_urls(session, urls, "modified feed")
+    vulnerabilities = payload.get("vulnerabilities", [])
+    log.info("Fetched modified feed size=%s", len(vulnerabilities))
+    return vulnerabilities
 
 
 def iter_feeds(

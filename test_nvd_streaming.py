@@ -49,7 +49,10 @@ def test_write_stream_handles_empty_input():
 
 
 def test_modified_feed_url_points_to_static_modified_snapshot():
-    assert nvd.modified_feed_url().endswith("/nvdcve-2.0-modified.json.gz")
+    urls = nvd.modified_feed_urls()
+
+    assert len(urls) >= 1
+    assert all(url.endswith("/nvdcve-2.0-modified.json.gz") for url in urls)
 
 
 def test_fetch_modified_overrides_builds_cve_id_map(monkeypatch):
