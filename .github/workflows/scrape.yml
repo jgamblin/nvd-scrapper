@@ -18,11 +18,6 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    # Retry once on transient failures (NIST outages, runner hiccups).
-    # Second attempt re-runs from scratch; the scraper is idempotent.
-    strategy:
-      max-attempts: 2
-      fail-fast: true
     steps:
       - name: Check out repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -36,11 +31,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Retry once on transient failures (NIST outages, runner hiccups).
+      # The scraper is idempotent, so a second attempt re-runs from scratch.
       - name: Run scraper
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08 # v3.0.2
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
           GITHUB_SHA: ${{ github.sha }}
-        run: python3 nvd.py
+        with:
+          timeout_minutes: 170
+          max_attempts: 2
+          command: python3 nvd.py
 
       - name: Verify output looks sane
         run: |
