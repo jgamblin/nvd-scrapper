@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: read
+  # Needed to open/update/close the failure-tracking issue.
+  issues: write
 
 concurrency:
   group: scrape-and-publish
@@ -116,3 +118,45 @@ jobs:
         env:
           HEALTHCHECKS_PING_URL: ${{ secrets.HEALTHCHECKS_PING_URL }}
         run: curl --fail --retry 3 "$HEALTHCHECKS_PING_URL"
+
+      # On failure, last-known-good in R2 is untouched (upload only runs on a
+      # clean scrape). Open or update a single tracking issue so a failure is
+      # visible instead of buried in the Actions tab.
+      - name: Open or update failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create scrape-failure --color B60205 \
+            --description "Automated: scrape pipeline failure" --force || true
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          body=$(printf '%s\n\n%s\n%s\n\n%s' \
+            "The scrape-and-publish run failed." \
+            "When (UTC): $ts" \
+            "Run log: $RUN_URL" \
+            "Last-known-good data in R2 is untouched (upload only runs on a clean scrape).")
+          existing="$(gh issue list --state open --label scrape-failure \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Scrape pipeline failure" \
+              --label scrape-failure --body "$body"
+          fi
+
+      # When a run succeeds again, close any open failure issue so it doubles
+      # as a recovered/not-recovered signal.
+      - name: Close failure issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --state open --label scrape-failure \
+            --json number --jq '.[].number'); do
+            gh issue comment "$n" --body "Recovered: a later run succeeded. $RUN_URL"
+            gh issue close "$n"
+          done
