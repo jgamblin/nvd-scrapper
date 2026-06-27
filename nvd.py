@@ -5,8 +5,14 @@ Reads `NVD_API_KEY` from the environment. Writes a JSON array to
 compatibility). Also writes `metadata.json` with run statistics.
 
 Data path (fastest to slowest):
-  1. Static gzip feed files from static.nvd.nist.gov / nvd.nist.gov
-  2. NVD REST API (services.nvd.nist.gov) -- per-year fallback when feeds fail
+  1. Static gzip feed files from static.nvd.nist.gov / nvd.nist.gov,
+     partitioned by CVE-ID year (nvdcve-2.0-<year>.json.gz holds every
+     CVE-<year>-* record regardless of publication date).
+  2. NVD REST API (services.nvd.nist.gov) -- per-year fallback when feeds
+     fail. The API can only be queried by publication date, so the fallback
+     returns a DIFFERENT partition than the feeds. The final write dedups by
+     CVE ID to absorb the overlap; years served by the fallback are recorded
+     in metadata as potentially incomplete (`years_via_api`).
 """
 
 import json
@@ -16,8 +22,9 @@ import shutil
 import sys
 import time
 import gzip
+from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 import urllib3.exceptions
@@ -28,6 +35,22 @@ NVD_FEED_BASES = [
 ]
 NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 PAGE_SIZE = 2000
+# NIST's WAF (fronting Cloudflare/Akamai) blocks non-browser User-Agents from
+# flagged source IPs such as CI runners, so a browser-like UA is required. A
+# single hardcoded string is a single point of failure: if NIST ever blocks it
+# we want to rotate without a code deploy. Hence a pool plus an env override
+# (NVD_USER_AGENT). Order is rotation priority; keep these current -- a stale
+# browser version is itself a signal WAFs score as suspicious.
+DEFAULT_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
+# The NVD REST API rejects any pubStartDate/pubEndDate range wider than 120
+# days (HTTP 404). Stay safely under that when chunking a year.
+API_MAX_WINDOW_DAYS = 120
 # Feeds: fail fast (2 attempts), then fall back to REST API.
 MAX_FEED_RETRIES = 2
 # REST API: more patience since it's the last resort.
@@ -37,24 +60,75 @@ RETRY_BACKOFF_SECONDS = 10
 # 50 requests per 30s. A 1s delay is conservative but keeps us well clear.
 API_PAGE_DELAY_SECONDS = 1.0
 REQUEST_TIMEOUT = 300
+# Abort if the final dataset is grossly short of what the API reports as the
+# total CVE count. Catches silently-dropped years that the size check misses.
+COMPLETENESS_MIN_RATIO = 0.90
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("nvd")
 
 
-def build_session() -> requests.Session:
-    return requests.Session()
+@dataclass
+class Crawler:
+    """Holds the HTTP session, User-Agent rotation state, and run stats.
+
+    A single object threaded through the fetch path so that a block detected
+    on any request can rotate the shared UA, and so fallback years can be
+    recorded for the metadata health report.
+    """
+
+    session: requests.Session
+    user_agents: list[str]
+    ua_index: int = 0
+    years_via_api: list[int] = field(default_factory=list)
+
+    def apply_user_agent(self) -> None:
+        self.session.headers["User-Agent"] = self.user_agents[self.ua_index]
+
+    def rotate_user_agent(self) -> bool:
+        """Advance to the next UA in the pool. Returns False if exhausted."""
+        if self.ua_index + 1 < len(self.user_agents):
+            self.ua_index += 1
+            self.apply_user_agent()
+            return True
+        return False
 
 
-def build_headers(api_key: str) -> dict:
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/58.0.3029.110 Safari/537.3"
-        ),
-        "apiKey": api_key,
-    }
+def resolve_user_agents() -> list[str]:
+    override = os.environ.get("NVD_USER_AGENT", "").strip()
+    if override:
+        return [override]
+    return list(DEFAULT_USER_AGENTS)
+
+
+def build_crawler(api_key: str) -> Crawler:
+    session = requests.Session()
+    # An empty apiKey header makes the REST API return 404; only send it when
+    # we actually have a key.
+    if api_key:
+        session.headers["apiKey"] = api_key
+    crawler = Crawler(session=session, user_agents=resolve_user_agents())
+    crawler.apply_user_agent()
+    return crawler
+
+
+def looks_like_block(resp: requests.Response) -> bool:
+    """True if a response looks like a WAF block rather than real data.
+
+    Catches hard blocks (401/403/418/429) and "soft" blocks where a challenge
+    page is returned as a 2xx/3xx with an HTML body -- which would otherwise
+    surface as a confusing gzip/JSON decode error deep in parsing.
+
+    A 5xx response with an HTML body is a gateway/origin error (e.g. NIST's
+    502 pages), not a WAF block, so it is deliberately NOT treated as one --
+    rotating the limited UA pool on plain outages would exhaust it before a
+    real block could use it.
+    """
+    if resp.status_code in (401, 403, 418, 429):
+        return True
+    if resp.status_code < 400:
+        return "text/html" in resp.headers.get("Content-Type", "").lower()
+    return False
 
 
 def iter_feed_years(start_year: int = 2002, end_year: int | None = None):
@@ -102,7 +176,7 @@ def _log_request_error(label: str, attempt: int, max_attempts: int, url: str, ex
 
 
 def _load_gzip_json_from_urls(
-    session: requests.Session,
+    crawler: Crawler,
     urls: list[str],
     label: str,
 ) -> dict:
@@ -111,7 +185,15 @@ def _load_gzip_json_from_urls(
     for attempt in range(1, MAX_FEED_RETRIES + 1):
         for url in urls:
             try:
-                with session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
+                with crawler.session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
+                    if looks_like_block(resp):
+                        rotated = crawler.rotate_user_agent()
+                        log.warning(
+                            "%s appears blocked (HTTP %s) on %s; rotated UA=%s",
+                            label, resp.status_code, url, rotated,
+                        )
+                        last_exc = RuntimeError(f"blocked HTTP {resp.status_code}")
+                        continue
                     resp.raise_for_status()
                     resp.raw.decode_content = False
                     with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
@@ -136,36 +218,72 @@ def _load_gzip_json_from_urls(
 
 
 def _fetch_api_page(
-    session: requests.Session,
-    headers: dict,
+    crawler: Crawler,
     url: str,
     label: str,
 ) -> dict:
     last_exc = None
     for attempt in range(1, MAX_API_RETRIES + 1):
         try:
-            resp = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-            resp.raise_for_status()
-            return resp.json()
+            resp = crawler.session.get(url, timeout=REQUEST_TIMEOUT)
+            if looks_like_block(resp):
+                rotated = crawler.rotate_user_agent()
+                log.warning(
+                    "%s appears blocked (HTTP %s); rotated UA=%s",
+                    label, resp.status_code, rotated,
+                )
+                last_exc = RuntimeError(f"blocked HTTP {resp.status_code}")
+            else:
+                resp.raise_for_status()
+                return resp.json()
         except (requests.RequestException, ValueError) as exc:
             last_exc = exc
             _log_request_error(label, attempt, MAX_API_RETRIES, url, exc)
-            if attempt < MAX_API_RETRIES:
-                delay = _retry_delay_seconds(exc, attempt)
-                log.warning("%s retrying in %.1fs", label, delay)
-                time.sleep(delay)
+
+        if attempt < MAX_API_RETRIES:
+            delay = _retry_delay_seconds(last_exc, attempt)
+            log.warning("%s retrying in %.1fs", label, delay)
+            time.sleep(delay)
 
     raise RuntimeError(f"API fetch failed for {label} after {MAX_API_RETRIES} attempts") from last_exc
 
 
-def fetch_year_via_api(
-    session: requests.Session,
-    headers: dict,
+def fetch_total(crawler: Crawler) -> int | None:
+    """Return the API's reported total CVE count, or None if unavailable.
+
+    Used only as a completeness sanity check; never fatal on its own.
+    """
+    url = f"{NVD_API_BASE}?resultsPerPage=1&startIndex=0"
+    try:
+        data = _fetch_api_page(crawler, url, "totalResults probe")
+        return int(data.get("totalResults", 0))
+    except (RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _iter_year_windows(year: int):
+    """Yield (start, end) datetimes covering `year` in <=120-day windows.
+
+    The NVD API caps pubStartDate/pubEndDate ranges at 120 days, so a full
+    calendar year must be split into several windows.
+    """
+    window = timedelta(days=API_MAX_WINDOW_DAYS)
+    start = datetime(year, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    year_end = datetime(year, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc)
+    while start <= year_end:
+        end = min(start + window - timedelta(milliseconds=1), year_end)
+        yield start, end
+        start = end + timedelta(milliseconds=1)
+
+
+def _fetch_api_window(
+    crawler: Crawler,
     year: int,
+    win_start: datetime,
+    win_end: datetime,
 ) -> list[dict]:
-    """Paginate the REST API for one calendar year. Used when feeds fail."""
-    pub_start = f"{year}-01-01T00:00:00.000"
-    pub_end = f"{year}-12-31T23:59:59.999"
+    pub_start = win_start.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    pub_end = win_end.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
     base_url = (
         f"{NVD_API_BASE}?pubStartDate={pub_start}&pubEndDate={pub_end}"
         f"&resultsPerPage={PAGE_SIZE}"
@@ -177,17 +295,15 @@ def fetch_year_via_api(
 
     while True:
         url = f"{base_url}&startIndex={start_index}"
-        label = f"API year={year} offset={start_index}"
-        data = _fetch_api_page(session, headers, url, label)
+        label = f"API year={year} window={pub_start[:10]} offset={start_index}"
+        data = _fetch_api_page(crawler, url, label)
 
         if total is None:
             total = int(data.get("totalResults", 0))
-            log.info("API fallback year=%s total=%s", year, total)
 
         page = data.get("vulnerabilities", [])
         results.extend(page)
         start_index += len(page)
-        log.info("API fallback year=%s fetched=%s/%s", year, start_index, total)
 
         if not page or start_index >= total:
             break
@@ -197,15 +313,42 @@ def fetch_year_via_api(
     return results
 
 
+def fetch_year_via_api(
+    crawler: Crawler,
+    year: int,
+) -> list[dict]:
+    """Paginate the REST API for one calendar year. Used when feeds fail.
+
+    Splits the year into <=120-day windows to respect the API's range limit.
+    Note: the API partitions by publication date, not CVE-ID year, so the
+    result is not identical to the feed file for the same year. The caller's
+    final dedup-by-ID absorbs the resulting overlap.
+    """
+    results: list[dict] = []
+    for win_start, win_end in _iter_year_windows(year):
+        window_items = _fetch_api_window(crawler, year, win_start, win_end)
+        results.extend(window_items)
+        log.info(
+            "API fallback year=%s window=%s items=%s running_total=%s",
+            year,
+            win_start.strftime("%Y-%m-%d"),
+            len(window_items),
+            len(results),
+        )
+        time.sleep(API_PAGE_DELAY_SECONDS)
+
+    log.info("API fallback year=%s complete total=%s", year, len(results))
+    return results
+
+
 def fetch_feed(
-    session: requests.Session,
-    headers: dict,
+    crawler: Crawler,
     year: int,
 ) -> list[dict]:
     urls = feed_urls_for_year(year)
     log.info("Fetching feed year=%s", year)
     try:
-        payload = _load_gzip_json_from_urls(session, urls, f"feed year={year}")
+        payload = _load_gzip_json_from_urls(crawler, urls, f"feed year={year}")
         vulnerabilities = payload.get("vulnerabilities", [])
         log.info("Fetched feed year=%s size=%s", year, len(vulnerabilities))
         return vulnerabilities
@@ -213,21 +356,21 @@ def fetch_feed(
         log.warning(
             "Feed failed for year=%s (%s) -- falling back to REST API", year, feed_exc
         )
-        return fetch_year_via_api(session, headers, year)
+        crawler.years_via_api.append(year)
+        return fetch_year_via_api(crawler, year)
 
 
-def fetch_modified_feed(session: requests.Session) -> list[dict]:
+def fetch_modified_feed(crawler: Crawler) -> list[dict]:
     urls = modified_feed_urls()
     log.info("Fetching modified feed snapshot")
-    payload = _load_gzip_json_from_urls(session, urls, "modified feed")
+    payload = _load_gzip_json_from_urls(crawler, urls, "modified feed")
     vulnerabilities = payload.get("vulnerabilities", [])
     log.info("Fetched modified feed size=%s", len(vulnerabilities))
     return vulnerabilities
 
 
 def iter_feeds(
-    session: requests.Session,
-    headers: dict,
+    crawler: Crawler,
     start_year: int,
     end_year: int,
     override_ids: set[str] | None = None,
@@ -236,7 +379,7 @@ def iter_feeds(
     override_ids = override_ids or set()
     years = list(iter_feed_years(start_year, end_year))
     for index, year in enumerate(years):
-        page = fetch_feed(session, headers, year)
+        page = fetch_feed(crawler, year)
         if override_ids:
             page = [item for item in page if cve_id_for_item(item) not in override_ids]
         yield page
@@ -246,18 +389,17 @@ def iter_feeds(
 
 
 def fetch_modified_overrides(
-    session: requests.Session,
+    crawler: Crawler,
 ) -> dict[str, dict]:
     overrides = {}
-    for item in fetch_modified_feed(session):
+    for item in fetch_modified_feed(crawler):
         overrides[cve_id_for_item(item)] = item
     log.info("Fetched %s modified-feed override CVEs", len(overrides))
     return overrides
 
 
 def iter_all_pages(
-    session: requests.Session,
-    headers: dict,
+    crawler: Crawler,
     start_year: int,
     end_year: int,
     overrides: dict[str, dict],
@@ -266,8 +408,7 @@ def iter_all_pages(
     override_ids = set(overrides)
 
     yield from iter_feeds(
-        session,
-        headers,
+        crawler,
         start_year,
         end_year,
         override_ids=override_ids,
@@ -279,30 +420,58 @@ def iter_all_pages(
 
 
 def write_stream(pages, out_path: str) -> int:
-    """Stream an iterator of page-lists into a JSON array file. Returns the total CVE count."""
+    """Stream an iterator of page-lists into a JSON array file.
+
+    Dedups by CVE ID (keeping the first record seen) so that overlap between
+    the feed partition (by ID year) and the API fallback partition (by
+    publication date) cannot emit duplicate CVEs. Returns the unique count.
+    """
     count = 0
+    duplicates = 0
+    seen: set[str] = set()
     with open(out_path, "w") as f:
         f.write("[")
         first = True
         for page in pages:
             for item in page:
+                cve_id = cve_id_for_item(item)
+                if cve_id in seen:
+                    duplicates += 1
+                    continue
+                seen.add(cve_id)
                 if not first:
                     f.write(",")
                 json.dump(item, f, separators=(",", ":"))
                 first = False
                 count += 1
         f.write("]")
+    if duplicates:
+        log.info("Skipped %s duplicate CVE records during write", duplicates)
     return count
 
 
 def write_metadata(
-    path: str, cve_count: int, started_at: datetime, finished_at: datetime
+    path: str,
+    cve_count: int,
+    started_at: datetime,
+    finished_at: datetime,
+    years_via_api: list[int],
+    expected_total: int | None,
 ) -> None:
+    completeness_ratio = None
+    if expected_total:
+        completeness_ratio = round(cve_count / expected_total, 4)
     metadata = {
         "last_run_iso": finished_at.isoformat(),
         "cve_count": cve_count,
         "duration_seconds": (finished_at - started_at).total_seconds(),
         "commit_sha": os.environ.get("GITHUB_SHA", "local"),
+        # Health signals so downstream consumers can tell a clean run from a
+        # degraded one stitched together via the API fallback.
+        "degraded": bool(years_via_api),
+        "years_via_api": sorted(years_via_api),
+        "expected_total": expected_total,
+        "completeness_ratio": completeness_ratio,
     }
     with open(path, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -310,8 +479,7 @@ def write_metadata(
 
 def main() -> int:
     api_key = os.environ.get("NVD_API_KEY", "")
-    session = build_session()
-    headers = build_headers(api_key)
+    crawler = build_crawler(api_key)
     started_at = datetime.now(timezone.utc)
 
     request_delay_seconds = float(os.environ.get("NVD_REQUEST_DELAY_SECONDS", "3"))
@@ -325,6 +493,12 @@ def main() -> int:
         log.error("Invalid feed year range: %s > %s", start_year, end_year)
         return 2
 
+    # The completeness gate compares against the API's global total, which is
+    # only a valid expectation when crawling the entire corpus. A deliberately
+    # restricted range is legitimately smaller, so don't fail it on that basis.
+    current_year = datetime.now(timezone.utc).year
+    full_corpus_run = start_year <= 2002 and end_year >= current_year
+
     log.info("Fetching NVD feeds for years %s-%s", start_year, end_year)
 
     try:
@@ -332,15 +506,14 @@ def main() -> int:
         if include_modified_overlay:
             log.info("Fetching modified-feed overlay")
             try:
-                overrides = fetch_modified_overrides(session)
+                overrides = fetch_modified_overrides(crawler)
             except RuntimeError as exc:
                 log.warning("Skipping modified-feed overlay due to errors: %s", exc)
                 overrides = {}
 
         cve_count = write_stream(
             iter_all_pages(
-                session,
-                headers,
+                crawler,
                 start_year,
                 end_year,
                 overrides,
@@ -356,11 +529,44 @@ def main() -> int:
         log.error("Scrape produced 0 CVEs -- aborting")
         return 4
 
+    # Completeness check: compare against the API's reported total. Only fails
+    # on a gross shortfall, so a flaky probe (returns None) never blocks a run,
+    # and only for a full-corpus run where the global total is the right
+    # expectation.
+    expected_total = fetch_total(crawler)
+    if expected_total and full_corpus_run:
+        ratio = cve_count / expected_total
+        if ratio < COMPLETENESS_MIN_RATIO:
+            log.error(
+                "Scrape incomplete: got %s CVEs, API reports %s total (%.1f%%) -- aborting",
+                cve_count,
+                expected_total,
+                100.0 * ratio,
+            )
+            return 5
+        log.info(
+            "Completeness: %s/%s CVEs (%.2f%%)", cve_count, expected_total, 100.0 * ratio
+        )
+
     # Duplicate for consumer compatibility (see design §4)
     shutil.copyfile("nvd.json", "nvd.jsonl")
 
     finished_at = datetime.now(timezone.utc)
-    write_metadata("metadata.json", cve_count, started_at, finished_at)
+    write_metadata(
+        "metadata.json",
+        cve_count,
+        started_at,
+        finished_at,
+        crawler.years_via_api,
+        # Only meaningful as an expectation for a full-corpus run.
+        expected_total if full_corpus_run else None,
+    )
+
+    if crawler.years_via_api:
+        log.warning(
+            "Run degraded: years served via API fallback (may be incomplete): %s",
+            sorted(crawler.years_via_api),
+        )
 
     log.info(
         "Wrote %s CVEs to nvd.json / nvd.jsonl in %ss",
