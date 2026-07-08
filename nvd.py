@@ -63,6 +63,21 @@ REQUEST_TIMEOUT = 300
 # Abort if the final dataset is grossly short of what the API reports as the
 # total CVE count. Catches silently-dropped years that the size check misses.
 COMPLETENESS_MIN_RATIO = 0.90
+# Per-year coverage guard. The global completeness ratio can't see a single
+# lost early year -- 1999 is ~1.5k of ~360k, well inside 90% -- so also check
+# each year individually. Historical CVE-ID-year counts only ever grow (NVD
+# keeps rejected CVEs as REJECT records), so any shrink means dropped records.
+# Fail if a year drops more than this fraction below the last published run,
+# ignoring shrink smaller than YEAR_DROP_MIN_ABS so a one-off reject on a tiny
+# year doesn't trip the ratio.
+YEAR_DROP_TOLERANCE = 0.02
+YEAR_DROP_MIN_ABS = 5
+# Last published run's metadata, read to get the previous per-year counts for
+# the drop check. Set to empty to disable the drop check (the empty-year floor
+# still applies). Defaults to the public feed this scraper publishes.
+BASELINE_METADATA_URL = os.environ.get(
+    "BASELINE_METADATA_URL", "https://nvd.handsonhacking.org/metadata.json"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("nvd")
@@ -148,6 +163,17 @@ def modified_feed_urls() -> list[str]:
 
 def cve_id_for_item(item: dict) -> str:
     return item["cve"]["id"]
+
+
+def year_from_cve_id(cve_id: str) -> int | None:
+    """Extract the numeric year from a CVE ID like 'CVE-1999-0001'."""
+    parts = cve_id.split("-")
+    if len(parts) >= 3:
+        try:
+            return int(parts[1])
+        except ValueError:
+            return None
+    return None
 
 
 def _retry_delay_seconds(exc: Exception, attempt: int) -> float:
@@ -419,12 +445,15 @@ def iter_all_pages(
         yield list(overrides.values())
 
 
-def write_stream(pages, out_path: str) -> int:
+def write_stream(pages, out_path: str, year_counts: dict[int, int] | None = None) -> int:
     """Stream an iterator of page-lists into a JSON array file.
 
     Dedups by CVE ID (keeping the first record seen) so that overlap between
     the feed partition (by ID year) and the API fallback partition (by
     publication date) cannot emit duplicate CVEs. Returns the unique count.
+
+    If `year_counts` is provided it is populated in place with the number of
+    unique CVEs per CVE-ID year, for the per-year coverage guard.
     """
     count = 0
     duplicates = 0
@@ -439,6 +468,10 @@ def write_stream(pages, out_path: str) -> int:
                     duplicates += 1
                     continue
                 seen.add(cve_id)
+                if year_counts is not None:
+                    year = year_from_cve_id(cve_id)
+                    if year is not None:
+                        year_counts[year] = year_counts.get(year, 0) + 1
                 if not first:
                     f.write(",")
                 json.dump(item, f, separators=(",", ":"))
@@ -457,6 +490,7 @@ def write_metadata(
     finished_at: datetime,
     years_via_api: list[int],
     expected_total: int | None,
+    year_counts: dict[int, int] | None = None,
 ) -> None:
     completeness_ratio = None
     if expected_total:
@@ -472,9 +506,67 @@ def write_metadata(
         "years_via_api": sorted(years_via_api),
         "expected_total": expected_total,
         "completeness_ratio": completeness_ratio,
+        # Per-year CVE-ID counts. Published so the next run can diff against it
+        # for the per-year drop check, and so consumers can spot a thin year.
+        "year_counts": (
+            {str(y): year_counts[y] for y in sorted(year_counts)} if year_counts else {}
+        ),
     }
     with open(path, "w") as f:
         json.dump(metadata, f, indent=2)
+
+
+def fetch_baseline_year_counts(url: str = BASELINE_METADATA_URL) -> dict[int, int]:
+    """Best-effort fetch of the last published run's per-year counts.
+
+    Returns {year -> count}, or {} if unavailable or the published metadata
+    predates per-year tracking. Never raises: a missing baseline just means the
+    drop check is skipped and only the empty-year floor applies.
+    """
+    if not url:
+        return {}
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json().get("year_counts") or {}
+        return {int(y): int(c) for y, c in raw.items()}
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        log.warning("Baseline year_counts unavailable (%s); skipping drop check", exc)
+        return {}
+
+
+def verify_year_coverage(
+    year_counts: dict[int, int], baseline: dict[int, int], current_year: int
+) -> list[str]:
+    """Return a list of per-year coverage problems (empty list == OK).
+
+    Two guards against a feed that silently loses a year's records while the
+    global total still looks complete:
+
+      1. Empty-year floor: no complete historical year (earliest..current-1)
+         may have zero CVEs. This is the "1999 went missing" failure.
+      2. Drop check: no year may shrink more than YEAR_DROP_TOLERANCE below the
+         last published run. Historical CVE-ID-year counts only grow, so a real
+         shrink means dropped records.
+    """
+    if not year_counts:
+        return ["no per-year counts were computed"]
+
+    problems: list[str] = []
+    earliest = min(year_counts)
+    for year in range(earliest, current_year):
+        if year_counts.get(year, 0) <= 0:
+            problems.append(f"year {year} is empty (a complete historical year should not be)")
+
+    for year, prev in sorted(baseline.items()):
+        now = year_counts.get(year, 0)
+        drop = prev - now
+        if drop > YEAR_DROP_MIN_ABS and now < prev * (1 - YEAR_DROP_TOLERANCE):
+            problems.append(
+                f"year {year} shrank from {prev} to {now} "
+                f"({100.0 * drop / prev:.1f}% below the last published run)"
+            )
+    return problems
 
 
 def main() -> int:
@@ -511,6 +603,7 @@ def main() -> int:
                 log.warning("Skipping modified-feed overlay due to errors: %s", exc)
                 overrides = {}
 
+        year_counts: dict[int, int] = {}
         cve_count = write_stream(
             iter_all_pages(
                 crawler,
@@ -520,6 +613,7 @@ def main() -> int:
                 request_delay_seconds=request_delay_seconds,
             ),
             "nvd.json",
+            year_counts=year_counts,
         )
     except RuntimeError as exc:
         log.error("Scrape failed before completion: %s", exc)
@@ -548,6 +642,26 @@ def main() -> int:
             "Completeness: %s/%s CVEs (%.2f%%)", cve_count, expected_total, 100.0 * ratio
         )
 
+    # Per-year coverage gate: catches a single lost year that the global ratio
+    # can't (see YEAR_DROP_TOLERANCE). Only meaningful for a full-corpus run --
+    # a restricted range legitimately omits years. Failing here returns before
+    # the upload step, so the last-known-good data in R2 is left untouched.
+    if full_corpus_run:
+        baseline = fetch_baseline_year_counts()
+        problems = verify_year_coverage(year_counts, baseline, current_year)
+        if problems:
+            for problem in problems:
+                log.error("Per-year coverage check failed: %s", problem)
+            log.error("Aborting: per-year coverage regressed -- not publishing partial data")
+            return 6
+        log.info(
+            "Per-year coverage OK: %s years (%s-%s), none empty%s",
+            len(year_counts),
+            min(year_counts),
+            max(year_counts),
+            f", none shrinking vs {len(baseline)} baseline years" if baseline else "",
+        )
+
     # Duplicate for consumer compatibility (see design §4)
     shutil.copyfile("nvd.json", "nvd.jsonl")
 
@@ -560,6 +674,7 @@ def main() -> int:
         crawler.years_via_api,
         # Only meaningful as an expectation for a full-corpus run.
         expected_total if full_corpus_run else None,
+        year_counts,
     )
 
     if crawler.years_via_api:
