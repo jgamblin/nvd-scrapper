@@ -12,7 +12,7 @@ Every three hours, GitHub Actions runs `nvd.py`, which pulls the full NVD 2.0 AP
 
 - `https://nvd.handsonhacking.org/nvd.json` — full CVE dataset as a JSON array
 - `https://nvd.handsonhacking.org/nvd.jsonl` — byte-identical copy (historical name)
-- `https://nvd.handsonhacking.org/metadata.json` — `{last_run_iso, cve_count, duration_seconds, commit_sha}`
+- `https://nvd.handsonhacking.org/metadata.json` — `{last_run_iso, cve_count, duration_seconds, commit_sha, degraded, years_via_api, expected_total, completeness_ratio, year_counts}` (`year_counts` maps each CVE-ID year to its count and powers the per-year coverage guard)
 
 ## Design & plan
 
