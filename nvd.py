@@ -4,17 +4,27 @@ Reads `NVD_API_KEY` from the environment. Writes a JSON array to
 `nvd.json` (and a byte-identical copy to `nvd.jsonl` for consumer
 compatibility). Also writes `metadata.json` with run statistics.
 
-Data path (fastest to slowest):
-  1. Static gzip feed files from static.nvd.nist.gov / nvd.nist.gov,
-     partitioned by CVE-ID year (nvdcve-2.0-<year>.json.gz holds every
-     CVE-<year>-* record regardless of publication date).
-  2. NVD REST API (services.nvd.nist.gov) -- per-year fallback when feeds
-     fail. The API can only be queried by publication date, so the fallback
-     returns a DIFFERENT partition than the feeds. The final write dedups by
-     CVE ID to absorb the overlap; years served by the fallback are recorded
-     in metadata as potentially incomplete (`years_via_api`).
+Data path:
+  1. Gzip feed files from nvd.nist.gov / static.nvd.nist.gov, partitioned by
+     CVE-ID year (nvdcve-2.0-<year>.json.gz holds every CVE-<year>-* record
+     regardless of publication date). NIST rebuilds these ~daily, so they are
+     the static backbone of the dataset.
+  2. The `modified` feed, overlaid on top. This is the only source of every
+     CVE published since the last year-feed rebuild, so it carries the entire
+     leading edge. Losing it publishes a snapshot that looks internally
+     complete but is hundreds of CVEs short, which is why it is fatal here
+     rather than a warning.
+  3. NVD REST API (services.nvd.nist.gov) -- a per-year fallback that is
+     DISABLED for full-corpus runs. The API can only be queried by publication
+     date while the feeds partition by CVE-ID year, so substituting it drops
+     every CVE-<year>-* record published in a later year. Set
+     NVD_ALLOW_API_FALLBACK=1 to re-enable it.
+
+Nothing is published unless the result is at or above the last published
+snapshot, per year and in total; see verify_year_coverage.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -30,8 +40,12 @@ import requests
 import urllib3.exceptions
 
 NVD_FEED_BASES = [
-    "https://static.nvd.nist.gov/feeds/json/cve/2.0",
+    # nvd.nist.gov leads: static.nvd.nist.gov returns HTTP 502 to CI ranges on
+    # essentially every request, so trying it first cost a wasted round trip
+    # and a spurious warning on all 26 fetches of every run. Keep it as the
+    # failover host in case the primary is the one having a bad day.
     "https://nvd.nist.gov/feeds/json/cve/2.0",
+    "https://static.nvd.nist.gov/feeds/json/cve/2.0",
 ]
 NVD_API_BASE = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 PAGE_SIZE = 2000
@@ -51,11 +65,26 @@ DEFAULT_USER_AGENTS = [
 # The NVD REST API rejects any pubStartDate/pubEndDate range wider than 120
 # days (HTTP 404). Stay safely under that when chunking a year.
 API_MAX_WINDOW_DAYS = 120
-# Feeds: fail fast (2 attempts), then fall back to REST API.
-MAX_FEED_RETRIES = 2
+# Retry profile for every gzip feed, year files and the modified feed alike.
+#
+# Both fail the same way and in the same window: while NIST regenerates a
+# file, static.nvd.nist.gov returns 502 and nvd.nist.gov returns 404. The old
+# budget (2 attempts, ~11 seconds) gave up inside that window. For the
+# modified feed that meant publishing a snapshot which looked internally
+# complete but was missing the entire leading edge; for a year file it meant
+# falling through to the REST API and its wrong partition.
+#
+# Both are fatal now, so both wait the regeneration out. This ladder spans
+# roughly eight minutes (15 + 30 + 60 + 120 + 240). The cost is paid once:
+# the first year that exhausts its retries aborts the whole run, so a bad NIST
+# day does not multiply the wait across 25 files.
+MAX_FEED_RETRIES = 6
+FEED_BACKOFF_SECONDS = 15
+FEED_MAX_BACKOFF_SECONDS = 240
 # REST API: more patience since it's the last resort.
 MAX_API_RETRIES = 5
 RETRY_BACKOFF_SECONDS = 10
+API_MAX_BACKOFF_SECONDS = 120
 # NVD requires 6s between API requests without a key; with a key the limit is
 # 50 requests per 30s. A 1s delay is conservative but keeps us well clear.
 API_PAGE_DELAY_SECONDS = 1.0
@@ -67,14 +96,23 @@ COMPLETENESS_MIN_RATIO = 0.90
 # lost early year -- 1999 is ~1.5k of ~360k, well inside 90% -- so also check
 # each year individually. Historical CVE-ID-year counts only ever grow (NVD
 # keeps rejected CVEs as REJECT records), so any shrink means dropped records.
-# Fail if a year drops more than this fraction below the last published run,
-# ignoring shrink smaller than YEAR_DROP_MIN_ABS so a one-off reject on a tiny
-# year doesn't trip the ratio.
-YEAR_DROP_TOLERANCE = 0.02
-YEAR_DROP_MIN_ABS = 5
-# Last published run's metadata, read to get the previous per-year counts for
-# the drop check. Set to empty to disable the drop check (the empty-year floor
-# still applies). Defaults to the public feed this scraper publishes.
+#
+# This is a hard non-regression check rather than a percentage tolerance. The
+# 2% tolerance it replaces worked out to ~800 CVEs on a big year, which let
+# every regression actually observed in production (45 to 447 CVEs) through
+# untouched. The allowances below exist only to absorb genuine CVE rejections,
+# which run at a handful per week across the whole corpus.
+YEAR_DROP_ALLOWANCE = 5
+# The current year is still accumulating and sees the most reject churn, so
+# give it a wider allowance than a settled historical year.
+CURRENT_YEAR_DROP_ALLOWANCE = 25
+# The same rule applied to the corpus total, which catches a shortfall spread
+# thinly across many years.
+TOTAL_DROP_ALLOWANCE = 25
+# Last published run's metadata, read for the previous per-year counts and
+# total. A baseline that cannot be read is fatal for a full-corpus run unless
+# NVD_ALLOW_MISSING_BASELINE=1: silently skipping the regression check is how
+# a short dataset reaches consumers in the first place.
 BASELINE_METADATA_URL = os.environ.get(
     "BASELINE_METADATA_URL", "https://nvd.handsonhacking.org/metadata.json"
 )
@@ -96,6 +134,12 @@ class Crawler:
     user_agents: list[str]
     ua_index: int = 0
     years_via_api: list[int] = field(default_factory=list)
+    # When False, a failed year feed aborts the run instead of falling back to
+    # the REST API. The API can only be queried by publication date while the
+    # feeds partition by CVE-ID year, so substituting one for the other
+    # silently drops every CVE-<year>-* record published in a later year. A
+    # single 2023 feed failure cost ~7.5k records that way.
+    allow_api_fallback: bool = True
 
     def apply_user_agent(self) -> None:
         self.session.headers["User-Agent"] = self.user_agents[self.ua_index]
@@ -116,13 +160,17 @@ def resolve_user_agents() -> list[str]:
     return list(DEFAULT_USER_AGENTS)
 
 
-def build_crawler(api_key: str) -> Crawler:
+def build_crawler(api_key: str, allow_api_fallback: bool = True) -> Crawler:
     session = requests.Session()
     # An empty apiKey header makes the REST API return 404; only send it when
     # we actually have a key.
     if api_key:
         session.headers["apiKey"] = api_key
-    crawler = Crawler(session=session, user_agents=resolve_user_agents())
+    crawler = Crawler(
+        session=session,
+        user_agents=resolve_user_agents(),
+        allow_api_fallback=allow_api_fallback,
+    )
     crawler.apply_user_agent()
     return crawler
 
@@ -176,7 +224,18 @@ def year_from_cve_id(cve_id: str) -> int | None:
     return None
 
 
-def _retry_delay_seconds(exc: Exception, attempt: int) -> float:
+def _retry_delay_seconds(
+    exc: Exception,
+    attempt: int,
+    base_seconds: float = RETRY_BACKOFF_SECONDS,
+    max_seconds: float = API_MAX_BACKOFF_SECONDS,
+) -> float:
+    """Seconds to wait before `attempt`+1, honouring Retry-After when given.
+
+    Backs off exponentially from `base_seconds` and caps at `max_seconds`, so
+    a caller can spend a long time waiting out a feed regeneration without
+    hammering NIST.
+    """
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         retry_after = exc.response.headers.get("Retry-After")
         if retry_after:
@@ -188,7 +247,7 @@ def _retry_delay_seconds(exc: Exception, attempt: int) -> float:
                     return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
                 except (TypeError, ValueError):
                     pass
-    return float(RETRY_BACKOFF_SECONDS * attempt)
+    return float(min(max_seconds, base_seconds * (2 ** (attempt - 1))))
 
 
 def _log_request_error(label: str, attempt: int, max_attempts: int, url: str, exc: Exception) -> None:
@@ -205,10 +264,13 @@ def _load_gzip_json_from_urls(
     crawler: Crawler,
     urls: list[str],
     label: str,
+    max_attempts: int = MAX_FEED_RETRIES,
+    base_backoff: float = FEED_BACKOFF_SECONDS,
+    max_backoff: float = FEED_MAX_BACKOFF_SECONDS,
 ) -> dict:
     last_exc = None
 
-    for attempt in range(1, MAX_FEED_RETRIES + 1):
+    for attempt in range(1, max_attempts + 1):
         for url in urls:
             try:
                 with crawler.session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
@@ -231,15 +293,15 @@ def _load_gzip_json_from_urls(
                 urllib3.exceptions.HTTPError,
             ) as exc:
                 last_exc = exc
-                _log_request_error(label, attempt, MAX_FEED_RETRIES, url, exc)
+                _log_request_error(label, attempt, max_attempts, url, exc)
 
-        if attempt < MAX_FEED_RETRIES:
-            delay = _retry_delay_seconds(last_exc, attempt)
+        if attempt < max_attempts:
+            delay = _retry_delay_seconds(last_exc, attempt, base_backoff, max_backoff)
             log.warning("%s retrying all hosts in %.1fs", label, delay)
             time.sleep(delay)
 
     raise RuntimeError(
-        f"Feed fetch failed for {label} after {MAX_FEED_RETRIES} attempts"
+        f"Feed fetch failed for {label} after {max_attempts} attempts"
     ) from last_exc
 
 
@@ -379,6 +441,13 @@ def fetch_feed(
         log.info("Fetched feed year=%s size=%s", year, len(vulnerabilities))
         return vulnerabilities
     except RuntimeError as feed_exc:
+        if not crawler.allow_api_fallback:
+            raise RuntimeError(
+                f"Feed fetch failed for year={year} and the REST API fallback is "
+                f"disabled: the API partitions by publication date, not CVE-ID "
+                f"year, so substituting it would silently drop every "
+                f"CVE-{year}-* record published in a later year"
+            ) from feed_exc
         log.warning(
             "Feed failed for year=%s (%s) -- falling back to REST API", year, feed_exc
         )
@@ -483,6 +552,16 @@ def write_stream(pages, out_path: str, year_counts: dict[int, int] | None = None
     return count
 
 
+def sha256_file(path: str, chunk_size: int = 8 * 1024 * 1024) -> str:
+    """Streaming SHA-256 of a file, published so consumers can validate the
+    1.7 GB object without trusting the transfer."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def write_metadata(
     path: str,
     cve_count: int,
@@ -491,6 +570,9 @@ def write_metadata(
     years_via_api: list[int],
     expected_total: int | None,
     year_counts: dict[int, int] | None = None,
+    data_object_key: str = "nvd.json",
+    data_bytes: int | None = None,
+    data_sha256: str | None = None,
 ) -> None:
     completeness_ratio = None
     if expected_total:
@@ -511,67 +593,115 @@ def write_metadata(
         "year_counts": (
             {str(y): year_counts[y] for y in sorted(year_counts)} if year_counts else {}
         ),
+        # Companion-manifest fields. Together with cve_count and year_counts
+        # these let a consumer fetch ~2 KB, decide whether the 1.7 GB object is
+        # worth downloading, and verify it end to end once it has.
+        "schema_version": 2,
+        "data_object_key": data_object_key,
+        "bytes": data_bytes,
+        "sha256": data_sha256,
     }
     with open(path, "w") as f:
         json.dump(metadata, f, indent=2)
 
 
-def fetch_baseline_year_counts(url: str = BASELINE_METADATA_URL) -> dict[int, int]:
-    """Best-effort fetch of the last published run's per-year counts.
+def fetch_baseline_metadata(url: str = BASELINE_METADATA_URL) -> dict | None:
+    """Fetch the last published run's metadata, or None if it can't be read.
 
-    Returns {year -> count}, or {} if unavailable or the published metadata
-    predates per-year tracking. Never raises: a missing baseline just means the
-    drop check is skipped and only the empty-year floor applies.
+    None means the regression check has no baseline to compare against, which
+    main() treats as fatal for a full-corpus run. The previous best-effort
+    version returned {} on failure, which silently disabled the only guard
+    standing between a short scrape and every downstream consumer.
     """
     if not url:
-        return {}
+        return None
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
-        raw = resp.json().get("year_counts") or {}
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        log.error("Baseline metadata unavailable at %s: %s", url, exc)
+        return None
+    if not isinstance(data, dict):
+        log.error("Baseline metadata at %s is not a JSON object", url)
+        return None
+    return data
+
+
+def baseline_year_counts(metadata: dict) -> dict[int, int]:
+    """Extract {year -> count} from published metadata, or {} if absent.
+
+    An empty result is legitimate for metadata predating per-year tracking;
+    the caller still has the total and the empty-year floor.
+    """
+    raw = metadata.get("year_counts") or {}
+    try:
         return {int(y): int(c) for y, c in raw.items()}
-    except (requests.RequestException, ValueError, TypeError) as exc:
-        log.warning("Baseline year_counts unavailable (%s); skipping drop check", exc)
+    except (AttributeError, TypeError, ValueError):
+        log.warning("Baseline year_counts is malformed; treating it as absent")
         return {}
 
 
 def verify_year_coverage(
-    year_counts: dict[int, int], baseline: dict[int, int], current_year: int
+    year_counts: dict[int, int],
+    baseline: dict[int, int],
+    current_year: int,
+    cve_count: int | None = None,
+    baseline_total: int | None = None,
 ) -> list[str]:
-    """Return a list of per-year coverage problems (empty list == OK).
+    """Return a list of coverage problems (empty list == OK).
 
-    Two guards against a feed that silently loses a year's records while the
-    global total still looks complete:
+    Three guards against a run that silently loses records while the global
+    completeness ratio still looks fine:
 
-      1. Empty-year floor: no complete historical year (earliest..current-1)
-         may have zero CVEs. This is the "1999 went missing" failure.
-      2. Drop check: no year may shrink more than YEAR_DROP_TOLERANCE below the
-         last published run. Historical CVE-ID-year counts only grow, so a real
-         shrink means dropped records.
+      1. Empty-year floor: no complete historical year may have zero CVEs.
+         This is the "1999 went missing" failure.
+      2. Per-year non-regression: no year may fall below the last published
+         run by more than a small allowance for genuine CVE rejections.
+         Historical CVE-ID-year counts only grow (NVD keeps rejected CVEs as
+         REJECT records), so a real shrink means dropped records.
+      3. Total non-regression: the same rule on the corpus total, which
+         catches a shortfall spread too thinly to trip any single year.
     """
     if not year_counts:
         return ["no per-year counts were computed"]
 
     problems: list[str] = []
-    earliest = min(year_counts)
+
+    # Take the year range from the union of this run and the baseline. Deriving
+    # `earliest` from year_counts alone made a year that vanished off the low
+    # end invisible to this guard: lose all of 1999 and the floor simply starts
+    # at 2000 instead.
+    known_years = set(year_counts) | set(baseline)
+    earliest = min(known_years)
     for year in range(earliest, current_year):
         if year_counts.get(year, 0) <= 0:
             problems.append(f"year {year} is empty (a complete historical year should not be)")
 
     for year, prev in sorted(baseline.items()):
         now = year_counts.get(year, 0)
-        drop = prev - now
-        if drop > YEAR_DROP_MIN_ABS and now < prev * (1 - YEAR_DROP_TOLERANCE):
+        allowance = (
+            CURRENT_YEAR_DROP_ALLOWANCE if year >= current_year else YEAR_DROP_ALLOWANCE
+        )
+        if now < prev - allowance:
             problems.append(
                 f"year {year} shrank from {prev} to {now} "
-                f"({100.0 * drop / prev:.1f}% below the last published run)"
+                f"({prev - now} CVEs below the last published run, "
+                f"allowance {allowance})"
             )
+
+    if cve_count is not None and baseline_total and cve_count < baseline_total - TOTAL_DROP_ALLOWANCE:
+        problems.append(
+            f"corpus total shrank from {baseline_total} to {cve_count} "
+            f"({baseline_total - cve_count} CVEs below the last published run, "
+            f"allowance {TOTAL_DROP_ALLOWANCE})"
+        )
+
     return problems
 
 
 def main() -> int:
     api_key = os.environ.get("NVD_API_KEY", "")
-    crawler = build_crawler(api_key)
     started_at = datetime.now(timezone.utc)
 
     request_delay_seconds = float(os.environ.get("NVD_REQUEST_DELAY_SECONDS", "3"))
@@ -591,7 +721,21 @@ def main() -> int:
     current_year = datetime.now(timezone.utc).year
     full_corpus_run = start_year <= 2002 and end_year >= current_year
 
-    log.info("Fetching NVD feeds for years %s-%s", start_year, end_year)
+    # The REST API fallback is off for a full-corpus run: it partitions by
+    # publication date rather than CVE-ID year, so it cannot stand in for a
+    # year feed without dropping records. A restricted-range run may still
+    # want it, and NVD_ALLOW_API_FALLBACK=1 forces it back on.
+    allow_api_fallback = (
+        not full_corpus_run or os.environ.get("NVD_ALLOW_API_FALLBACK", "").strip() == "1"
+    )
+    crawler = build_crawler(api_key, allow_api_fallback=allow_api_fallback)
+
+    log.info(
+        "Fetching NVD feeds for years %s-%s (api_fallback=%s)",
+        start_year,
+        end_year,
+        allow_api_fallback,
+    )
 
     try:
         overrides = {}
@@ -600,8 +744,16 @@ def main() -> int:
             try:
                 overrides = fetch_modified_overrides(crawler)
             except RuntimeError as exc:
-                log.warning("Skipping modified-feed overlay due to errors: %s", exc)
-                overrides = {}
+                # Fatal on purpose. The modified feed is the only source of
+                # every CVE published since NIST's last daily year-feed
+                # rebuild, so continuing without it publishes a snapshot that
+                # is internally complete but hundreds of CVEs short at the
+                # leading edge -- which is exactly what consumers saw as the
+                # dataset "going backwards". Returning here leaves the
+                # last-known-good object in R2 untouched.
+                log.error("Modified-feed overlay unavailable: %s", exc)
+                log.error("Aborting: refusing to publish without the leading edge")
+                return 7
 
         year_counts: dict[int, int] = {}
         cve_count = write_stream(
@@ -642,30 +794,62 @@ def main() -> int:
             "Completeness: %s/%s CVEs (%.2f%%)", cve_count, expected_total, 100.0 * ratio
         )
 
-    # Per-year coverage gate: catches a single lost year that the global ratio
-    # can't (see YEAR_DROP_TOLERANCE). Only meaningful for a full-corpus run --
-    # a restricted range legitimately omits years. Failing here returns before
+    # Coverage gate: hard non-regression against the last published run, per
+    # year and on the total (see YEAR_DROP_ALLOWANCE). Catches both a single
+    # lost year that the global ratio can't see and a shortfall spread too
+    # thinly to trip any one year. Only meaningful for a full-corpus run -- a
+    # restricted range legitimately omits years. Failing here returns before
     # the upload step, so the last-known-good data in R2 is left untouched.
     if full_corpus_run:
-        baseline = fetch_baseline_year_counts()
-        problems = verify_year_coverage(year_counts, baseline, current_year)
+        baseline_metadata = fetch_baseline_metadata()
+        if baseline_metadata is None:
+            if os.environ.get("NVD_ALLOW_MISSING_BASELINE", "").strip() == "1":
+                log.warning(
+                    "Baseline metadata unavailable; regression check disabled by "
+                    "NVD_ALLOW_MISSING_BASELINE"
+                )
+                baseline_metadata = {}
+            else:
+                log.error(
+                    "Aborting: baseline metadata unavailable, so a regression "
+                    "against the published snapshot cannot be ruled out"
+                )
+                log.error(
+                    "Set NVD_ALLOW_MISSING_BASELINE=1 to publish anyway "
+                    "(bootstrap only)"
+                )
+                return 8
+
+        baseline = baseline_year_counts(baseline_metadata)
+        baseline_total = baseline_metadata.get("cve_count")
+        if not isinstance(baseline_total, int):
+            baseline_total = None
+
+        problems = verify_year_coverage(
+            year_counts, baseline, current_year, cve_count, baseline_total
+        )
         if problems:
             for problem in problems:
                 log.error("Per-year coverage check failed: %s", problem)
             log.error("Aborting: per-year coverage regressed -- not publishing partial data")
             return 6
         log.info(
-            "Per-year coverage OK: %s years (%s-%s), none empty%s",
+            "Coverage OK: %s years (%s-%s), none empty%s%s",
             len(year_counts),
             min(year_counts),
             max(year_counts),
             f", none shrinking vs {len(baseline)} baseline years" if baseline else "",
+            f", total {cve_count} >= baseline {baseline_total}" if baseline_total else "",
         )
 
     # Duplicate for consumer compatibility (see design §4)
     shutil.copyfile("nvd.json", "nvd.jsonl")
 
     finished_at = datetime.now(timezone.utc)
+    data_bytes = os.path.getsize("nvd.json")
+    data_sha256 = sha256_file("nvd.json")
+    log.info("nvd.json bytes=%s sha256=%s", data_bytes, data_sha256)
+
     write_metadata(
         "metadata.json",
         cve_count,
@@ -675,6 +859,8 @@ def main() -> int:
         # Only meaningful as an expectation for a full-corpus run.
         expected_total if full_corpus_run else None,
         year_counts,
+        data_bytes=data_bytes,
+        data_sha256=data_sha256,
     )
 
     if crawler.years_via_api:
