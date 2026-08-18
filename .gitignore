@@ -3,6 +3,9 @@ nvd.json
 nvd.jsonl
 metadata.json
 
+# Watchdog high-water marks (restored from the Actions cache in CI)
+.mirror-state.json
+
 # Logs
 *.log
 

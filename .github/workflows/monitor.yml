@@ -1,0 +1,100 @@
+name: monitor-mirror
+
+# Watchdog for the published snapshot. Fetches the ~2 KB metadata.json and
+# fails if cve_count or any per-year count has fallen below the best value
+# ever observed.
+#
+# Deliberately NOT a Last-Modified/ETag monotonicity check: in every
+# regression this mirror has actually shipped, the object was freshly
+# published with a correctly advancing Last-Modified and simply contained
+# fewer CVEs than the object before it. Header watching would have caught
+# none of them.
+
+on:
+  schedule:
+    # Hourly gives ~3 observations per 3-hourly publish, which is enough to
+    # catch a bad snapshot well before the next one replaces it.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: monitor-mirror
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # High-water marks have to survive between runs. The run-id key always
+      # writes a fresh entry; restore-keys picks up the most recent one.
+      #
+      # save-always is deliberately left off. actions/cache runs its save step
+      # under post-if: success(), so when the check below fails the state file
+      # is NOT written back. That is what we want: the marks stay at the last
+      # healthy values instead of being lowered to the regressed ones, so the
+      # alert keeps firing until the mirror genuinely recovers.
+      - name: Restore mirror state
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .mirror-state.json
+          key: mirror-state-${{ github.run_id }}
+          restore-keys: |
+            mirror-state-
+
+      - name: Check mirror for regressions
+        id: check
+        run: python3 check_mirror.py --state .mirror-state.json
+
+      - name: Open or update regression issue
+        if: failure() && steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create mirror-regression --color B60205 \
+            --description "Automated: published snapshot went backwards" --force || true
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          body=$(printf '%s\n\n%s\n%s\n\n%s' \
+            "The published snapshot has fewer CVEs than a snapshot already served." \
+            "When (UTC): $ts" \
+            "Run log: $RUN_URL" \
+            "See the run log for which years regressed and by how much.")
+          existing="$(gh issue list --state open --label mirror-regression \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Published snapshot regressed" \
+              --label mirror-regression --body "$body"
+          fi
+
+      - name: Close regression issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --state open --label mirror-regression \
+            --json number --jq '.[].number'); do
+            gh issue comment "$n" --body "Recovered: the mirror is back at or above its high-water mark. $RUN_URL"
+            gh issue close "$n"
+          done

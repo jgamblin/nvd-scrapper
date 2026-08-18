@@ -41,24 +41,20 @@ jobs:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
           GITHUB_SHA: ${{ github.sha }}
         with:
-          timeout_minutes: 170
+          # Two attempts have to fit inside the job's 180-minute budget, so
+          # cap each one at 80. A healthy run finishes in 5-40 minutes; the
+          # long tail was the REST API fallback, which no longer runs.
+          timeout_minutes: 80
           max_attempts: 2
           command: python3 nvd.py
 
-      - name: Verify output looks sane
-        run: |
-          set -euo pipefail
-          test -f nvd.json
-          test -f nvd.jsonl
-          test -f metadata.json
-          bytes=$(stat -c %s nvd.json)
-          echo "nvd.json size: $bytes"
-          if [ "$bytes" -lt 100000000 ]; then
-            echo "nvd.json is suspiciously small ($bytes bytes) — aborting upload"
-            exit 1
-          fi
-          head -c 1 nvd.json | grep -q '\['
-          tail -c 1 nvd.json | grep -q '\]'
+      # Proves metadata.json describes the exact bytes we are about to upload
+      # (size + SHA-256), that the array is not truncated, that the run is not
+      # degraded, and that the file has not shrunk against what is already
+      # published. Replaces a fixed 100 MB floor that was ~5% of the real file
+      # size and so never fired on any regression that reached consumers.
+      - name: Verify manifest matches output
+        run: python3 verify_manifest.py
 
       - name: Install rclone
         uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
@@ -102,6 +98,11 @@ jobs:
             --header-upload "Cache-Control: public, max-age=300" \
             index.html "r2:$R2_BUCKET/index.html"
 
+      # nvd.json and nvd.jsonl are 1.7 GB, well past Cloudflare's 512 MB max
+      # cacheable file size, so they always serve cf-cache-status: DYNAMIC and
+      # this purge is a no-op for them. It is load-bearing for index.html and
+      # metadata.json; the large keys stay listed only so this keeps working
+      # if the object ever drops below the limit.
       - name: Purge Cloudflare cache for nvd subdomain
         env:
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
