@@ -1,14 +1,20 @@
 name: monitor-mirror
 
-# Watchdog for the published snapshot. Fetches the ~2 KB metadata.json and
-# fails if cve_count or any per-year count has fallen below the best value
-# ever observed.
+# Two independent watchdogs, one schedule.
 #
-# Deliberately NOT a Last-Modified/ETag monotonicity check: in every
-# regression this mirror has actually shipped, the object was freshly
+# `check` watches what we published: fetches the ~2 KB metadata.json and fails
+# if cve_count or any per-year count has fallen below the best value ever
+# observed. Deliberately NOT a Last-Modified/ETag monotonicity check -- in
+# every regression this mirror has actually shipped, the object was freshly
 # published with a correctly advancing Last-Modified and simply contained
-# fewer CVEs than the object before it. Header watching would have caught
-# none of them.
+# fewer CVEs than the object before it. Header watching would have caught none
+# of them.
+#
+# `upstream` watches what NIST is serving, which the first job cannot see: a
+# healthy published snapshot looks identical whether NIST is fine or has been
+# serving junk for a day. On 2026-08-27 it served year feeds that were HTTP
+# 200 with intact gzip over a near-empty array, and this job is what turns
+# that into "NIST is broken" rather than a stack of failed scrape runs.
 
 on:
   schedule:
@@ -96,5 +102,73 @@ jobs:
           for n in $(gh issue list --state open --label mirror-regression \
             --json number --jq '.[].number'); do
             gh issue comment "$n" --body "Recovered: the mirror is back at or above its high-water mark. $RUN_URL"
+            gh issue close "$n"
+          done
+
+  # Deliberately a separate job, not another step in `check` above.
+  # actions/cache saves under post-if: success(), so a step that failed here
+  # would also stop the mirror high-water marks from being written back --
+  # silently degrading the other watchdog to catch a fault in a third party.
+  # Separate jobs also keep the two signals legible: "our snapshot went
+  # backwards" and "NIST is serving junk" want different responses.
+  upstream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # HEAD per year feed plus one small GET for the modified feed, so the
+      # whole sweep is ~26 requests and no meaningful bandwidth.
+      - name: Check upstream NVD feeds
+        id: feeds
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: python3 check_feeds.py
+
+      - name: Open or update upstream issue
+        if: failure() && steps.feeds.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create upstream-feeds --color FBCA04 \
+            --description "Automated: NIST is serving incomplete feeds" --force || true
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          body=$(printf '%s\n\n%s\n%s\n\n%s\n%s' \
+            "NIST is serving year feeds that respond HTTP 200 with intact gzip but hold far fewer records than they declare." \
+            "When (UTC): $ts" \
+            "Run log: $RUN_URL (lists which feeds and by how much)" \
+            "This is upstream, not a fault in this repo. The scraper will refuse to publish while it lasts, which is correct -- the last-known-good snapshot in R2 keeps being served, so consumers get correct but increasingly stale data." \
+            "No action here beyond waiting for NIST, unless staleness itself becomes the bigger problem.")
+          existing="$(gh issue list --state open --label upstream-feeds \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Upstream NVD feeds are incomplete" \
+              --label upstream-feeds --body "$body"
+          fi
+
+      - name: Close upstream issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --state open --label upstream-feeds \
+            --json number --jq '.[].number'); do
+            gh issue comment "$n" --body "Recovered: every upstream feed is back above the completeness floor. $RUN_URL"
             gh issue close "$n"
           done

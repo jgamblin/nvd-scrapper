@@ -66,14 +66,27 @@ A run publishes only if every one of these holds. Any failure returns before the
 
 | Check | Failure mode it catches | Exit |
 |---|---|---|
-| Modified feed fetched | NIST 404s the feed mid-regeneration; publishing without it drops the whole leading edge | 7 |
-| Year feeds fetched, no REST API substitution | The API partitions by publication date, not CVE-ID year, so it silently drops records published in a later year | 3 |
+| Baseline manifest readable | A silently skipped regression check | 8 |
+| Modified feed fetched and intact | NIST 404s the feed mid-regeneration, or serves it truncated; publishing without it drops the whole leading edge | 7 |
+| Year feeds fetched and intact, no REST API substitution | A missing or truncated year feed. No API substitution: the API partitions by publication date, not CVE-ID year, so it silently drops records published in a later year | 3 |
+| Per-year and total non-regression vs the published snapshot | Any shrink beyond a small reject allowance | 6 |
+| Completeness ratio vs the API's reported total | Gross shortfall the per-year gate somehow missed | 5 |
+| `verify_manifest.py`: SHA-256, size vs manifest, array shape, `nvd.jsonl` matches, not degraded, above both the absolute and the relative size floor | A truncated or mismatched upload | 1 |
+
+The baseline manifest is read first, before any crawling. It is the reference for the per-year gates below, so a run that cannot read it fails in seconds rather than after a completed 30-minute crawl.
 
 Both feed kinds share one retry profile: 6 attempts over roughly 8 minutes. They fail the same way (502 from `static.nvd.nist.gov`, 404 from `nvd.nist.gov`) during the same NIST regeneration window, and both are fatal, so neither is less patient than the other. Only the first year that exhausts its retries aborts the run, so the wait is paid once rather than per file.
-| Baseline manifest readable | A silently skipped regression check | 8 |
-| Per-year and total non-regression vs the published snapshot | Any shrink beyond a small reject allowance | 6 |
-| Completeness ratio vs the API's reported total | Gross shortfall | 5 |
-| `verify_manifest.py`: SHA-256, size vs manifest, array shape, `nvd.jsonl` matches, not degraded, above both the absolute and the relative size floor | A truncated or mismatched upload | 1 |
+
+### Feed integrity
+
+"Fetched" is not the same as "intact". On 2026-08-27 NIST served year feeds that were truncated at the source with no transport-level symptom at all: HTTP 200, a complete CRC-valid gzip stream, well-formed JSON, and a truthful envelope above a near-empty array. `nvdcve-2.0-2022.json.gz` declared `resultsPerPage: 27531` above a `vulnerabilities` array holding one record; six years and the modified feed were each serving 1-18 records. Nothing in the transport layer can see that, because nothing is broken -- the file contradicts itself.
+
+That copy used to be logged as `Fetched feed year=2022 size=1`, an ordinary success, and the shortfall only surfaced 25 feeds later as a 46.9% aggregate ratio that named no years. Two floors now reject it as the failed fetch it is, which puts it on the existing retry ladder and host failover, and makes it fatal for that feed by name if it persists:
+
+1. **The envelope's own count.** Exact, and needs no external reference -- the feed is compared against itself. Checked against `resultsPerPage` rather than `totalResults`, so a paginated year file would still pass.
+2. **A sanity floor from the published baseline**, at `FEED_YEAR_MIN_RATIO` of that year's last-published count, applied as each year lands. This catches a feed that is internally consistent but grossly short -- the same failure with a header that has caught up -- which the envelope check is structurally unable to see. Gross shortfall only: the precise rule is the per-year non-regression gate, and this floor has to tolerate drift in the other direction, since a rejected CVE leaves the feed while staying in our snapshot. Note that `nvdcve-2.0-2002.json.gz` is not a single-year partition -- it holds every CVE-ID year up to and including 2002 -- so its floor sums the baseline's 2002-and-earlier years.
+
+The per-year gate is ordered ahead of the global completeness ratio on purpose. Both would fail a short scrape, but the per-year gate says which years are short and by how much, where the ratio only says `46.9%`.
 
 ### Environment overrides
 
@@ -86,6 +99,23 @@ Both feed kinds share one retry profile: 6 attempts over roughly 8 minutes. They
 | `NVD_ALLOW_MISSING_BASELINE` | unset | `1` publishes without a baseline (bootstrap only) |
 | `BASELINE_METADATA_URL` | the public manifest | Where to read the previous run's counts |
 | `NVD_USER_AGENT` | rotating pool | Override the User-Agent |
+
+## Monitoring
+
+Two watchdogs run hourly from `monitor.yml`, as separate jobs, because they answer different questions and want different responses.
+
+| Script | Watches | Fails when |
+|---|---|---|
+| [`check_mirror.py`](check_mirror.py) | the snapshot we publish | `cve_count` or any per-year count drops below the best value ever observed, or the snapshot is flagged `degraded` |
+| [`check_feeds.py`](check_feeds.py) | NIST's upstream feeds | a feed is served but holds far fewer records than it declares |
+
+`check_feeds.py` exists because a healthy published snapshot looks identical whether NIST is fine or has been serving truncated feeds for a day -- the mirror watchdog stays green while every scrape run fails, which is correct but leaves "why" to be reconstructed from a failed run log. It opens its own `upstream-feeds` issue, distinct from `scrape-failure`, so a NIST fault is not read as a fault here.
+
+It is cheap enough to run hourly: HEAD per year feed and one small GET for the modified feed, about 26 requests and no meaningful bandwidth. Year feeds are judged on gzipped bytes per expected record, which separates the two populations by three orders of magnitude (321-896 when healthy against 0.06-2.1 when truncated), and the modified feed -- which has no per-year baseline to size against, and matters most, being the sole source of the leading edge -- is fetched and checked against its own envelope with the same `nvd.assert_feed_intact` the scraper uses. An unreachable feed is reported but not failed on: NIST being *down* is what the scraper's retry ladder is for, and this watchdog is for feeds that are up and wrong.
+
+```bash
+python3 check_feeds.py
+```
 
 ## Tests
 
