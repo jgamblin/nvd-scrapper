@@ -317,8 +317,13 @@ def test_year_and_modified_feeds_share_one_retry_profile(monkeypatch):
     nvd.fetch_modified_feed(Mock())
     nvd.fetch_feed(nvd.build_crawler(""), 2023)
 
-    # Neither call site overrides the shared defaults.
-    assert all(args == () and kwargs == {} for _, args, kwargs in seen)
+    # Neither call site overrides the shared retry profile. min_records is
+    # not part of that profile -- it is the per-feed sanity floor, which only
+    # a year feed can compute -- so it is exempt here rather than asserted
+    # absent, which would forbid the floor outright.
+    retry_knobs = {"max_attempts", "base_backoff", "max_backoff"}
+    assert all(args == () for _, args, _ in seen)
+    assert all(not (retry_knobs & set(kwargs)) for _, _, kwargs in seen)
     assert [label for label, _, _ in seen] == ["modified feed", "feed year=2023"]
 
 
@@ -425,3 +430,172 @@ def test_guard_blocks_the_2026_08_14_regression():
 
     assert any("2026" in p and "shrank" in p for p in problems)
     assert any(p.startswith("corpus total shrank") for p in problems)
+
+
+# --- feed truncation detection --------------------------------------------
+#
+# The 2026-08-27 outage: NIST served year files that were truncated at the
+# source with no transport-level symptom. HTTP 200, a complete CRC-valid gzip
+# stream, well-formed JSON, and a truthful envelope above a near-empty array.
+# Captured from the live feeds that day:
+#
+#   year  resultsPerPage  vulnerabilities
+#   2015            8779                2
+#   2019           17623                1
+#   2021           23452                1
+#   2022           27531                1
+#   2023           31267               18
+#   2025           45200                2
+#   modified        7842              551
+#
+# Healthy files on the same day satisfied resultsPerPage == len(...) exactly
+# (2024: 39227, 2020: 21071, 2002: 6771).
+
+
+def _envelope(promised, actual, year=2022):
+    return {
+        "resultsPerPage": promised,
+        "startIndex": 0,
+        "totalResults": promised,
+        "format": "NVD_CVE",
+        "version": "2.0",
+        "vulnerabilities": [
+            {"cve": {"id": f"CVE-{year}-{i:04d}"}} for i in range(actual)
+        ],
+    }
+
+
+def testassert_feed_intact_accepts_a_healthy_feed():
+    # 2024 as served on the day of the outage.
+    nvd.assert_feed_intact(_envelope(39227, 39227, 2024))
+
+
+def testassert_feed_intact_rejects_the_2026_08_27_truncated_feeds():
+    for year, promised, actual in [
+        (2015, 8779, 2),
+        (2019, 17623, 1),
+        (2021, 23452, 1),
+        (2022, 27531, 1),
+        (2023, 31267, 18),
+        (2025, 45200, 2),
+    ]:
+        try:
+            nvd.assert_feed_intact(_envelope(promised, actual, year))
+        except nvd.TruncatedFeedError as exc:
+            # The message has to name the shortfall; reading "size=1" off the
+            # old log told you nothing.
+            assert str(promised) in str(exc)
+            assert str(actual) in str(exc)
+        else:
+            raise AssertionError(f"year {year} truncation went undetected")
+
+
+def testassert_feed_intact_catches_the_truncated_modified_feed():
+    try:
+        nvd.assert_feed_intact(_envelope(7842, 551))
+    except nvd.TruncatedFeedError:
+        pass
+    else:
+        raise AssertionError("truncated modified feed went undetected")
+
+
+def test_truncated_feed_error_is_retried_as_a_fetch_failure():
+    """A truncated feed must reach the retry ladder, not the caller.
+
+    TruncatedFeedError subclasses ValueError precisely so the existing except
+    clause in the fetch loop catches it. If that inheritance is ever dropped
+    the exception escapes the loop uncaught and the run dies with a traceback
+    instead of retrying and failing cleanly.
+    """
+    assert issubclass(nvd.TruncatedFeedError, ValueError)
+
+
+def testassert_feed_intact_tolerates_pagination():
+    """Compared against resultsPerPage, not totalResults, so a paginated year
+    file would not fail every fetch."""
+    payload = _envelope(500, 500)
+    payload["totalResults"] = 27531
+    nvd.assert_feed_intact(payload)
+
+
+def testassert_feed_intact_tolerates_a_missing_envelope_count():
+    nvd.assert_feed_intact({"vulnerabilities": []})
+
+
+def testassert_feed_intact_applies_the_baseline_floor():
+    """An envelope-consistent but grossly short feed -- the same failure with a
+    header that has caught up -- is invisible to the envelope check."""
+    payload = _envelope(3, 3)
+    nvd.assert_feed_intact(payload)  # envelope agrees
+    try:
+        nvd.assert_feed_intact(payload, min_records=13765)
+    except nvd.TruncatedFeedError as exc:
+        assert "13765" in str(exc)
+    else:
+        raise AssertionError("baseline floor did not fire")
+
+
+def test_expected_feed_size_folds_earlier_years_into_the_2002_file():
+    """nvdcve-2.0-2002.json.gz holds every CVE-ID year up to 2002 (verified
+    2026-08-27: 6771 records spanning 1999-2002). Reading baseline[2002] alone
+    would set its floor at a third of the truth."""
+    baseline = {1999: 1579, 2000: 1243, 2001: 1556, 2002: 2393, 2003: 1555}
+
+    assert nvd.expected_feed_size(2002, baseline) == 6771
+    assert nvd.expected_feed_size(2003, baseline) == 1555
+    assert nvd.expected_feed_size(2099, baseline) is None
+    assert nvd.expected_feed_size(2002, {}) is None
+
+
+def test_feed_min_records_tolerates_ordinary_drift():
+    """The 2020 feed served 21071 against a published baseline of 21074: a
+    rejected CVE leaves the feed but stays in our snapshot. The floor must not
+    fire on that -- the precise rule is verify_year_coverage()'s job."""
+    floor = nvd.feed_min_records(2020, {2020: 21074})
+
+    assert floor is not None and floor < 21071
+    # But it must still catch the outage: 2020 serving a single record.
+    assert floor > 1
+
+
+def test_feed_min_records_is_none_without_a_baseline():
+    assert nvd.feed_min_records(2022, {}) is None
+
+
+def test_fetch_feed_passes_the_baseline_floor_to_the_loader():
+    calls = {}
+
+    def fake_load(crawler, urls, label, **kwargs):
+        calls.update(kwargs)
+        return _envelope(10, 10)
+
+    crawler = nvd.build_crawler("", baseline_year_counts={2022: 27531})
+    import unittest.mock
+
+    with unittest.mock.patch.object(nvd, "_load_gzip_json_from_urls", fake_load):
+        nvd.fetch_feed(crawler, 2022)
+
+    assert calls["min_records"] == int(27531 * nvd.FEED_YEAR_MIN_RATIO)
+
+
+def test_truncated_year_feed_is_fatal_when_api_fallback_is_disabled():
+    """The whole point: a near-empty feed must abort the run at the year that
+    caused it, naming it, rather than being counted as a successful fetch of
+    one CVE and surfacing 25 feeds later as a 46.9% aggregate ratio."""
+    import unittest.mock
+
+    def always_truncated(crawler, urls, label, **kwargs):
+        raise RuntimeError(
+            f"Feed fetch failed for {label} after 6 attempts: {label}: envelope "
+            f"promises 27531 records but the array holds 1"
+        )
+
+    crawler = nvd.build_crawler("", allow_api_fallback=False)
+    with unittest.mock.patch.object(nvd, "_load_gzip_json_from_urls", always_truncated):
+        try:
+            nvd.fetch_feed(crawler, 2022)
+        except RuntimeError as exc:
+            assert "year=2022" in str(exc)
+            assert "27531" in str(exc)  # the cause is chained into the message
+        else:
+            raise AssertionError("expected the truncated feed to be fatal")
