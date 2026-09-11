@@ -5,6 +5,8 @@ real NVD API. It feeds a fake page iterator into `write_stream()` and
 asserts the output is valid JSON containing every item.
 """
 
+import gzip
+import io
 import json
 import os
 import tempfile
@@ -314,11 +316,15 @@ def test_year_and_modified_feeds_share_one_retry_profile(monkeypatch):
         return {"vulnerabilities": []}
 
     monkeypatch.setattr(nvd, "_load_gzip_json_from_urls", fake_load)
-    nvd.fetch_modified_feed(Mock())
+    nvd.fetch_modified_feed(nvd.build_crawler(""))
     nvd.fetch_feed(nvd.build_crawler(""), 2023)
 
-    # Neither call site overrides the shared defaults.
-    assert all(args == () and kwargs == {} for _, args, kwargs in seen)
+    # Neither call site overrides the shared retry defaults. Both do pass a
+    # freshness validator, which is not part of the retry profile.
+    retry_knobs = {"max_attempts", "base_backoff", "max_backoff"}
+    assert all(
+        args == () and not retry_knobs & set(kwargs) for _, args, kwargs in seen
+    )
     assert [label for label, _, _ in seen] == ["modified feed", "feed year=2023"]
 
 
@@ -425,3 +431,318 @@ def test_guard_blocks_the_2026_08_14_regression():
 
     assert any("2026" in p and "shrank" in p for p in problems)
     assert any(p.startswith("corpus total shrank") for p in problems)
+
+
+# --- feed freshness -------------------------------------------------------
+
+
+class _FakeRaw(io.BytesIO):
+    """BytesIO that tolerates the decode_content flag the loader sets."""
+
+    decode_content = False
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self.status_code = 200
+        self.headers = {"Content-Type": "application/gzip"}
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            gz.write(json.dumps(payload).encode())
+        self.raw = _FakeRaw(buf.getvalue())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeSession:
+    """Serves a canned payload per URL and records what was asked for."""
+
+    def __init__(self, by_url):
+        self.by_url = by_url
+        self.headers = {}
+        self.requested = []
+
+    def get(self, url, **kwargs):
+        self.requested.append(url)
+        return _FakeResponse(self.by_url[url])
+
+
+def _crawler_with(by_url, baseline_feed_timestamps=None):
+    crawler = nvd.Crawler(
+        session=_FakeSession(by_url),
+        user_agents=list(nvd.DEFAULT_USER_AGENTS),
+        baseline_feed_timestamps=baseline_feed_timestamps or {},
+    )
+    crawler.apply_user_agent()
+    return crawler
+
+
+def _feed(timestamp, count, first_id=1):
+    return {
+        "timestamp": timestamp,
+        "totalResults": count,
+        "vulnerabilities": [
+            {"cve": {"id": f"CVE-2026-{n:05d}"}} for n in range(first_id, first_id + count)
+        ],
+    }
+
+
+def test_feed_build_timestamp_parses_nist_format_as_utc():
+    # NIST writes seven fractional digits and no offset; the field is UTC.
+    built = nvd.feed_build_timestamp({"timestamp": "2026-09-11T03:00:01.8043137"})
+
+    assert built is not None
+    assert built.tzinfo is not None
+    assert built.utcoffset().total_seconds() == 0
+    assert (built.year, built.month, built.day, built.hour) == (2026, 9, 11, 3)
+
+
+def test_feed_build_timestamp_returns_none_when_unusable():
+    assert nvd.feed_build_timestamp({}) is None
+    assert nvd.feed_build_timestamp({"timestamp": ""}) is None
+    assert nvd.feed_build_timestamp({"timestamp": "not a date"}) is None
+    assert nvd.feed_build_timestamp({"timestamp": 1757559601}) is None
+
+
+def test_baseline_feed_timestamps_parses_and_tolerates_junk():
+    parsed = nvd.baseline_feed_timestamps(
+        {
+            "feed_timestamps": {
+                "2026": "2026-09-11T03:00:01.804313+00:00",
+                "modified": "2026-09-11T13:00:00+00:00",
+                "2025": "garbage",
+            }
+        }
+    )
+
+    assert set(parsed) == {"2026", "modified"}
+    assert parsed["2026"] < parsed["modified"]
+    assert nvd.baseline_feed_timestamps({}) == {}
+    assert nvd.baseline_feed_timestamps({"feed_timestamps": "nope"}) == {}
+
+
+def test_stale_validator_accepts_the_same_daily_build_again():
+    """The reason this compares builds and not run clocks.
+
+    NIST rebuilds the year feeds ~daily while this scraper runs every three
+    hours, so most runs legitimately re-consume the build their predecessor
+    used. Comparing the feed's timestamp against the last run's `last_run_iso`
+    instead would reject every one of them.
+    """
+    build = "2026-09-11T03:00:01.8043137"
+    crawler = _crawler_with({}, {"2026": nvd.feed_build_timestamp({"timestamp": build})})
+
+    validate = nvd._stale_feed_validator(crawler, "2026")
+
+    assert validate({"timestamp": build}) is None
+
+
+def test_stale_validator_rejects_an_older_build_and_allows_a_newer_one():
+    crawler = _crawler_with(
+        {}, {"2026": nvd.feed_build_timestamp({"timestamp": "2026-09-11T03:00:01"})}
+    )
+    validate = nvd._stale_feed_validator(crawler, "2026")
+
+    rejection = validate({"timestamp": "2026-09-10T03:00:02"})
+    assert rejection is not None
+    assert "stale build" in rejection
+
+    assert validate({"timestamp": "2026-09-12T03:00:00"}) is None
+
+
+def test_stale_validator_is_inert_without_a_baseline_or_a_timestamp():
+    # Bootstrap, and metadata predating feed_timestamps, must not block a run.
+    no_baseline = nvd._stale_feed_validator(_crawler_with({}), "2026")
+    assert no_baseline({"timestamp": "2020-01-01T00:00:00"}) is None
+
+    crawler = _crawler_with(
+        {}, {"2026": nvd.feed_build_timestamp({"timestamp": "2026-09-11T03:00:01"})}
+    )
+    assert nvd._stale_feed_validator(crawler, "2026")({}) is None
+
+
+def test_stale_feed_fails_over_to_the_other_host():
+    """Replay of the 2026-09-11 failure, which cost a whole run.
+
+    Run 34602304649 read 55,867 records from the 2026 feed -- exactly what
+    that feed had served all the previous day -- because an edge handed back
+    the day-old build. It was valid gzip, valid JSON, and internally
+    consistent, so nothing noticed until the coverage gate had already paid
+    for a 32-minute scrape. Now the stale copy is treated as a failed fetch
+    and the other host is tried.
+    """
+    stale, fresh = nvd.feed_urls_for_year(2026)
+    crawler = _crawler_with(
+        {
+            stale: _feed("2026-09-10T03:00:07.1", 55867),
+            fresh: _feed("2026-09-11T03:00:01.8043137", 56261),
+        },
+        {"2026": nvd.feed_build_timestamp({"timestamp": "2026-09-11T03:00:01.8043137"})},
+    )
+
+    items = nvd.fetch_feed(crawler, 2026)
+
+    assert len(items) == 56261
+    # The stale host was tried first and skipped, not silently accepted.
+    assert crawler.session.requested == [stale, fresh]
+    # And the accepted build is what gets published for the next run to use.
+    assert crawler.feed_timestamps["2026"].startswith("2026-09-11T03:00:01")
+    assert crawler.years_via_api == []
+
+
+def test_every_host_stale_is_a_failed_fetch_not_a_short_feed():
+    stale_urls = nvd.feed_urls_for_year(2026)
+    crawler = _crawler_with(
+        {url: _feed("2026-09-10T03:00:07.1", 55867) for url in stale_urls},
+        {"2026": nvd.feed_build_timestamp({"timestamp": "2026-09-11T03:00:01"})},
+    )
+
+    try:
+        nvd._load_gzip_json_from_urls(
+            crawler,
+            stale_urls,
+            "feed year=2026",
+            max_attempts=1,
+            validate=nvd._stale_feed_validator(crawler, "2026"),
+        )
+    except RuntimeError as exc:
+        assert "after 1 attempts" in str(exc)
+    else:
+        raise AssertionError("expected a stale feed to raise, not return short data")
+
+    assert crawler.session.requested == stale_urls
+
+
+def test_modified_feed_is_freshness_checked_too():
+    """The leading edge rebuilds every couple of hours, so a stale copy here
+    is the failure mode that started all of this: internally complete, and
+    hundreds of CVEs short at the top."""
+    stale, fresh = nvd.modified_feed_urls()
+    crawler = _crawler_with(
+        {
+            stale: _feed("2026-09-11T09:00:00", 6869),
+            fresh: _feed("2026-09-11T13:00:00", 7205),
+        },
+        {"modified": nvd.feed_build_timestamp({"timestamp": "2026-09-11T11:00:00"})},
+    )
+
+    assert len(nvd.fetch_modified_feed(crawler)) == 7205
+    assert crawler.feed_timestamps["modified"].startswith("2026-09-11T13:00:00")
+
+
+def test_write_metadata_publishes_the_feed_builds_it_consumed():
+    import datetime as _dt
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "metadata.json")
+        now = _dt.datetime(2026, 9, 11, tzinfo=_dt.timezone.utc)
+        nvd.write_metadata(
+            path,
+            10,
+            now,
+            now,
+            [],
+            10,
+            {2026: 10},
+            feed_timestamps={"modified": "2026-09-11T13:00:00+00:00",
+                             "2026": "2026-09-11T03:00:01+00:00"},
+        )
+
+        with open(path) as f:
+            meta = json.load(f)
+
+    assert meta["feed_timestamps"]["2026"] == "2026-09-11T03:00:01+00:00"
+    # Sorted, so a diff between two published manifests stays readable.
+    assert list(meta["feed_timestamps"]) == ["2026", "modified"]
+    # Purely additive: consumers pinned to v2 keep working.
+    assert meta["schema_version"] == 2
+
+
+def test_write_metadata_omits_feed_timestamps_gracefully():
+    import datetime as _dt
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "metadata.json")
+        now = _dt.datetime(2026, 9, 11, tzinfo=_dt.timezone.utc)
+        nvd.write_metadata(path, 10, now, now, [], 10, {2026: 10})
+
+        with open(path) as f:
+            meta = json.load(f)
+
+    assert meta["feed_timestamps"] == {}
+
+
+def test_missing_baseline_aborts_before_the_scrape(monkeypatch):
+    """The baseline moved to the top of main() so fetch_feed can use its feed
+    timestamps. That also means a run with no baseline now costs seconds
+    instead of failing after a half-hour scrape, so keep it that way."""
+    for var in ("NVD_ALLOW_MISSING_BASELINE", "NVD_FEED_START_YEAR", "NVD_FEED_END_YEAR"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(nvd, "fetch_baseline_metadata", lambda *a, **k: None)
+
+    def explode(*args, **kwargs):
+        raise AssertionError("scraped before checking the baseline")
+
+    monkeypatch.setattr(nvd, "fetch_modified_overrides", explode)
+    monkeypatch.setattr(nvd, "write_stream", explode)
+
+    assert nvd.main() == 8
+
+
+def test_baseline_feed_timestamps_reach_the_crawler(monkeypatch):
+    """End of the wire: what the published manifest says a run consumed is
+    what the next run's freshness check compares against."""
+    monkeypatch.delenv("NVD_ALLOW_MISSING_BASELINE", raising=False)
+    monkeypatch.setattr(
+        nvd,
+        "fetch_baseline_metadata",
+        lambda *a, **k: {
+            "cve_count": 389910,
+            "year_counts": {"2026": 56261},
+            "feed_timestamps": {"2026": "2026-09-11T03:00:01.804313+00:00"},
+        },
+    )
+    seen = {}
+
+    def capture(crawler, *args, **kwargs):
+        seen["baseline"] = crawler.baseline_feed_timestamps
+        raise RuntimeError("stop here -- the wiring is what is under test")
+
+    monkeypatch.setattr(nvd, "fetch_modified_overrides", capture)
+
+    assert nvd.main() == 7  # modified-feed overlay unavailable
+    assert set(seen["baseline"]) == {"2026"}
+    assert seen["baseline"]["2026"].hour == 3
+
+
+def test_feed_freshness_can_be_switched_off_without_losing_the_coverage_gate(monkeypatch):
+    """The off switch exists for one scenario: NIST republishing a feed with
+    an earlier timestamp, which would wedge every run. It must not take the
+    per-year coverage gate down with it."""
+    monkeypatch.setenv("NVD_SKIP_FEED_FRESHNESS", "1")
+    monkeypatch.delenv("NVD_ALLOW_MISSING_BASELINE", raising=False)
+    baseline = {
+        "cve_count": 389910,
+        "year_counts": {"2026": 56261},
+        "feed_timestamps": {"2026": "2026-09-11T03:00:01+00:00"},
+    }
+    monkeypatch.setattr(nvd, "fetch_baseline_metadata", lambda *a, **k: baseline)
+    seen = {}
+
+    def capture(crawler, *args, **kwargs):
+        seen["baseline"] = crawler.baseline_feed_timestamps
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(nvd, "fetch_modified_overrides", capture)
+
+    assert nvd.main() == 7
+    assert seen["baseline"] == {}
+    # The counts baseline is untouched, so a shrunk year is still caught.
+    assert nvd.baseline_year_counts(baseline) == {2026: 56261}

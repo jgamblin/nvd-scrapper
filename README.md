@@ -33,6 +33,7 @@ The dataset is assembled from two NIST sources:
   "sha256": "…",
   "cve_count": 378606,
   "year_counts": { "1999": 1579, "…": 0 },
+  "feed_timestamps": { "2026": "2026-08-17T03:00:01+00:00", "modified": "…" },
   "degraded": false,
   "years_via_api": [],
   "expected_total": 378675,
@@ -48,6 +49,7 @@ Fetch the manifest before the 1.8 GB object and refuse to ingest a snapshot that
 
 - `cve_count` and every entry in `year_counts` should be at or above the last values you accepted. Genuine CVE rejections move these by a handful of records; a drop of hundreds means a bad snapshot.
 - `degraded` should be `false` and `years_via_api` empty.
+- `feed_timestamps` records the build time of each NIST feed the run consumed. The next run refuses any feed built before these, which is how a CDN edge replaying an older build gets caught at fetch time rather than after the scrape.
 - `sha256` and `bytes` let you verify the object end to end once you have it.
 
 `check_mirror.py` in this repo does exactly that and can be run by anyone:
@@ -84,6 +86,7 @@ Both feed kinds share one retry profile: 6 attempts over roughly 8 minutes. They
 | `NVD_INCLUDE_MODIFIED_OVERLAY` | `1` | Set `0` to skip the overlay. A full-corpus run will then fail the non-regression gate, because skipping the overlay is precisely the bug these gates exist to stop |
 | `NVD_ALLOW_API_FALLBACK` | off for full-corpus runs | `1` re-enables the REST API fallback. A full-corpus run will still be stopped by the non-regression gate and by `verify_manifest.py`'s `degraded` check, so this is only useful with a restricted range |
 | `NVD_ALLOW_MISSING_BASELINE` | unset | `1` publishes without a baseline (bootstrap only) |
+| `NVD_SKIP_FEED_FRESHNESS` | unset | `1` stops rejecting feeds built before the ones the last published run used. Only needed if NIST republishes a feed with an earlier timestamp, which would otherwise wedge every run. Leaves the coverage gate in place |
 | `BASELINE_METADATA_URL` | the public manifest | Where to read the previous run's counts |
 | `NVD_USER_AGENT` | rotating pool | Override the User-Agent |
 

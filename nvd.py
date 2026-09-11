@@ -28,10 +28,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
 import gzip
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
@@ -140,6 +142,12 @@ class Crawler:
     # silently drops every CVE-<year>-* record published in a later year. A
     # single 2023 feed failure cost ~7.5k records that way.
     allow_api_fallback: bool = True
+    # Feed build timestamps the last published run consumed, keyed by feed
+    # ("2026", "modified"), and the ones this run actually accepted. The first
+    # is what _stale_feed_validator compares against; the second is published
+    # in metadata.json so the next run has a baseline in turn.
+    baseline_feed_timestamps: dict[str, datetime] = field(default_factory=dict)
+    feed_timestamps: dict[str, str] = field(default_factory=dict)
 
     def apply_user_agent(self) -> None:
         self.session.headers["User-Agent"] = self.user_agents[self.ua_index]
@@ -213,6 +221,93 @@ def cve_id_for_item(item: dict) -> str:
     return item["cve"]["id"]
 
 
+def feed_build_timestamp(payload: dict) -> datetime | None:
+    """Parse a feed payload's own build timestamp, as UTC.
+
+    NIST stamps every feed with the time it was generated, e.g.
+    "2026-09-11T03:00:01.8043137" -- naive, but documented as UTC. Returns
+    None when the field is missing or unparseable, which callers must treat
+    as "unknown" rather than "stale": an unreadable timestamp means NIST
+    changed the format, not that the feed rolled back.
+    """
+    raw = payload.get("timestamp")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = raw.strip()
+    # NIST writes 7 fractional digits; fromisoformat took at most 6 before
+    # 3.11. Truncating keeps this parseable across interpreter versions.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        log.warning("Feed timestamp %r is not ISO 8601; treating it as unknown", raw)
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _stale_feed_validator(crawler: Crawler, key: str) -> Callable[[dict], str | None]:
+    """Reject a feed build older than the one the last published run used.
+
+    A stale CDN edge serves a previous day's build: valid gzip, valid JSON,
+    internally consistent totalResults -- and several hundred CVEs short. On
+    2026-09-11 that cost a run, because the only thing that noticed was the
+    coverage gate, by which point the feeds were already fetched and the whole
+    run had to be thrown away.
+
+    The comparison is per feed against the build the baseline consumed, NOT
+    against the baseline run's own clock. NIST rebuilds a year feed only when
+    something in it changed -- the 2003 feed served on 2026-09-11 was built on
+    2026-08-28 -- and this scraper runs every 3 hours regardless, so the
+    correct, current build is almost always older than the run that last used
+    it. Comparing against a run clock would reject every feed we fetch.
+    """
+
+    def validate(payload: dict) -> str | None:
+        built_at = feed_build_timestamp(payload)
+        baseline_built_at = crawler.baseline_feed_timestamps.get(key)
+        if built_at is None or baseline_built_at is None:
+            # No baseline (bootstrap, or metadata predating this field) and an
+            # unreadable timestamp both mean "nothing to compare", which must
+            # not block a run that is otherwise fine.
+            return None
+        if built_at < baseline_built_at:
+            return (
+                f"stale build {built_at.isoformat()} predates the "
+                f"{baseline_built_at.isoformat()} build the last published "
+                f"run used -- a rolled-back copy, not new data"
+            )
+        return None
+
+    return validate
+
+
+def _record_feed_timestamp(crawler: Crawler, key: str, payload: dict) -> None:
+    built_at = feed_build_timestamp(payload)
+    if built_at is not None:
+        crawler.feed_timestamps[key] = built_at.isoformat()
+
+
+def baseline_feed_timestamps(metadata: dict) -> dict[str, datetime]:
+    """Extract {feed -> build time} from published metadata, or {} if absent.
+
+    Empty is legitimate for metadata predating this field; the caller simply
+    has no freshness baseline for that run, and the coverage gate still backs
+    it up after the fact.
+    """
+    raw = metadata.get("feed_timestamps") or {}
+    if not isinstance(raw, dict):
+        log.warning("Baseline feed_timestamps is malformed; treating it as absent")
+        return {}
+    parsed: dict[str, datetime] = {}
+    for key, value in raw.items():
+        built_at = feed_build_timestamp({"timestamp": value})
+        if built_at is not None:
+            parsed[str(key)] = built_at
+    return parsed
+
+
 def year_from_cve_id(cve_id: str) -> int | None:
     """Extract the numeric year from a CVE ID like 'CVE-1999-0001'."""
     parts = cve_id.split("-")
@@ -267,7 +362,16 @@ def _load_gzip_json_from_urls(
     max_attempts: int = MAX_FEED_RETRIES,
     base_backoff: float = FEED_BACKOFF_SECONDS,
     max_backoff: float = FEED_MAX_BACKOFF_SECONDS,
+    validate: Callable[[dict], str | None] | None = None,
 ) -> dict:
+    """Fetch and parse a gzipped JSON feed, trying every host then retrying.
+
+    `validate` sees each parsed payload and returns a rejection reason to have
+    it treated as a failed fetch, or None to accept it. A payload that parses
+    is not necessarily the payload we want, and routing the bad ones through
+    this function's existing host-failover and backoff gives a stale or broken
+    edge a chance to be bypassed rather than losing the run.
+    """
     last_exc = None
 
     for attempt in range(1, max_attempts + 1):
@@ -285,7 +389,12 @@ def _load_gzip_json_from_urls(
                     resp.raise_for_status()
                     resp.raw.decode_content = False
                     with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
-                        return json.load(gz_stream)
+                        payload = json.load(gz_stream)
+                rejection = validate(payload) if validate else None
+                if rejection is None:
+                    return payload
+                log.warning("%s rejected from %s: %s", label, url, rejection)
+                last_exc = RuntimeError(rejection)
             except (
                 OSError,
                 requests.RequestException,
@@ -436,9 +545,20 @@ def fetch_feed(
     urls = feed_urls_for_year(year)
     log.info("Fetching feed year=%s", year)
     try:
-        payload = _load_gzip_json_from_urls(crawler, urls, f"feed year={year}")
+        payload = _load_gzip_json_from_urls(
+            crawler,
+            urls,
+            f"feed year={year}",
+            validate=_stale_feed_validator(crawler, str(year)),
+        )
+        _record_feed_timestamp(crawler, str(year), payload)
         vulnerabilities = payload.get("vulnerabilities", [])
-        log.info("Fetched feed year=%s size=%s", year, len(vulnerabilities))
+        log.info(
+            "Fetched feed year=%s size=%s built=%s",
+            year,
+            len(vulnerabilities),
+            crawler.feed_timestamps.get(str(year), "unknown"),
+        )
         return vulnerabilities
     except RuntimeError as feed_exc:
         if not crawler.allow_api_fallback:
@@ -458,9 +578,19 @@ def fetch_feed(
 def fetch_modified_feed(crawler: Crawler) -> list[dict]:
     urls = modified_feed_urls()
     log.info("Fetching modified feed snapshot")
-    payload = _load_gzip_json_from_urls(crawler, urls, "modified feed")
+    payload = _load_gzip_json_from_urls(
+        crawler,
+        urls,
+        "modified feed",
+        validate=_stale_feed_validator(crawler, "modified"),
+    )
+    _record_feed_timestamp(crawler, "modified", payload)
     vulnerabilities = payload.get("vulnerabilities", [])
-    log.info("Fetched modified feed size=%s", len(vulnerabilities))
+    log.info(
+        "Fetched modified feed size=%s built=%s",
+        len(vulnerabilities),
+        crawler.feed_timestamps.get("modified", "unknown"),
+    )
     return vulnerabilities
 
 
@@ -573,6 +703,7 @@ def write_metadata(
     data_object_key: str = "nvd.json",
     data_bytes: int | None = None,
     data_sha256: str | None = None,
+    feed_timestamps: dict[str, str] | None = None,
 ) -> None:
     completeness_ratio = None
     if expected_total:
@@ -593,6 +724,11 @@ def write_metadata(
         "year_counts": (
             {str(y): year_counts[y] for y in sorted(year_counts)} if year_counts else {}
         ),
+        # Build timestamps of the NIST feeds this run consumed, keyed by feed
+        # ("2026", "modified"). The next run compares against these to spot a
+        # CDN edge handing back an older build -- valid JSON, hundreds of CVEs
+        # short -- before it has fetched the rest of the corpus.
+        "feed_timestamps": dict(sorted((feed_timestamps or {}).items())),
         # Companion-manifest fields. Together with cve_count and year_counts
         # these let a consumer fetch ~2 KB, decide whether the 1.7 GB object is
         # worth downloading, and verify it end to end once it has.
@@ -730,6 +866,51 @@ def main() -> int:
     )
     crawler = build_crawler(api_key, allow_api_fallback=allow_api_fallback)
 
+    # Read the baseline before fetching anything. It carries the feed build
+    # timestamps the last published run consumed, which fetch_feed needs in
+    # order to recognise a rolled-back feed while there is still time to retry
+    # another host -- and reading it up front also fails a missing-baseline run
+    # in seconds rather than after a half-hour scrape.
+    baseline_metadata: dict = {}
+    if full_corpus_run:
+        published = fetch_baseline_metadata()
+        if published is None:
+            if os.environ.get("NVD_ALLOW_MISSING_BASELINE", "").strip() == "1":
+                log.warning(
+                    "Baseline metadata unavailable; regression check disabled by "
+                    "NVD_ALLOW_MISSING_BASELINE"
+                )
+            else:
+                log.error(
+                    "Aborting: baseline metadata unavailable, so a regression "
+                    "against the published snapshot cannot be ruled out"
+                )
+                log.error(
+                    "Set NVD_ALLOW_MISSING_BASELINE=1 to publish anyway "
+                    "(bootstrap only)"
+                )
+                return 8
+        else:
+            baseline_metadata = published
+        # Off switch, separate from NVD_ALLOW_MISSING_BASELINE so that
+        # clearing a wedged freshness check does not also stand down the
+        # coverage gate. Needed if NIST ever republishes a feed with an
+        # earlier timestamp than the one we already consumed: every run would
+        # otherwise refuse that feed until the timestamp caught up.
+        if os.environ.get("NVD_SKIP_FEED_FRESHNESS", "").strip() == "1":
+            log.warning(
+                "Feed freshness check disabled by NVD_SKIP_FEED_FRESHNESS -- a "
+                "rolled-back feed will only be caught after the scrape, by the "
+                "coverage gate"
+            )
+        else:
+            crawler.baseline_feed_timestamps = baseline_feed_timestamps(baseline_metadata)
+            log.info(
+                "Freshness baseline: %s feed build timestamps from the last "
+                "published run",
+                len(crawler.baseline_feed_timestamps),
+            )
+
     log.info(
         "Fetching NVD feeds for years %s-%s (api_fallback=%s)",
         start_year,
@@ -801,25 +982,6 @@ def main() -> int:
     # restricted range legitimately omits years. Failing here returns before
     # the upload step, so the last-known-good data in R2 is left untouched.
     if full_corpus_run:
-        baseline_metadata = fetch_baseline_metadata()
-        if baseline_metadata is None:
-            if os.environ.get("NVD_ALLOW_MISSING_BASELINE", "").strip() == "1":
-                log.warning(
-                    "Baseline metadata unavailable; regression check disabled by "
-                    "NVD_ALLOW_MISSING_BASELINE"
-                )
-                baseline_metadata = {}
-            else:
-                log.error(
-                    "Aborting: baseline metadata unavailable, so a regression "
-                    "against the published snapshot cannot be ruled out"
-                )
-                log.error(
-                    "Set NVD_ALLOW_MISSING_BASELINE=1 to publish anyway "
-                    "(bootstrap only)"
-                )
-                return 8
-
         baseline = baseline_year_counts(baseline_metadata)
         baseline_total = baseline_metadata.get("cve_count")
         if not isinstance(baseline_total, int):
@@ -861,6 +1023,7 @@ def main() -> int:
         year_counts,
         data_bytes=data_bytes,
         data_sha256=data_sha256,
+        feed_timestamps=crawler.feed_timestamps,
     )
 
     if crawler.years_via_api:
