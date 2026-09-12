@@ -33,7 +33,6 @@ import shutil
 import sys
 import time
 import gzip
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
@@ -83,6 +82,21 @@ API_MAX_WINDOW_DAYS = 120
 MAX_FEED_RETRIES = 6
 FEED_BACKOFF_SECONDS = 15
 FEED_MAX_BACKOFF_SECONDS = 240
+# NVD's year files start at 2002, and that first file is not a single-year
+# partition: it holds every CVE-ID year up to and including 2002. Verified
+# 2026-08-27 -- nvdcve-2.0-2002.json.gz carried 6771 records spanning
+# 1999-2002, exactly the published per-year counts for those four years
+# summed. Every later file is a clean single year. So the expected size of the
+# 2002 feed is the sum of the baseline's 2002-and-earlier years; reading
+# baseline[2002] alone would set its floor at a third of the truth.
+FIRST_FEED_YEAR = 2002
+# Fetch-time sanity floor for a year feed, as a fraction of what the last
+# published run holds for that year. Only a gross shortfall: the precise
+# non-regression rule is verify_year_coverage()'s job, and this one has to
+# tolerate ordinary drift in the other direction -- the 2020 feed serves 21071
+# against a published baseline of 21074, because a rejected CVE leaves the
+# feed while staying in our snapshot.
+FEED_YEAR_MIN_RATIO = 0.5
 # REST API: more patience since it's the last resort.
 MAX_API_RETRIES = 5
 RETRY_BACKOFF_SECONDS = 10
@@ -142,10 +156,16 @@ class Crawler:
     # silently drops every CVE-<year>-* record published in a later year. A
     # single 2023 feed failure cost ~7.5k records that way.
     allow_api_fallback: bool = True
+    # Per-year counts from the last published run, used as a fetch-time sanity
+    # floor (see assert_feed_intact). Empty disables that floor; the
+    # envelope check is unconditional either way.
+    baseline_year_counts: dict[int, int] = field(default_factory=dict)
     # Feed build timestamps the last published run consumed, keyed by feed
     # ("2026", "modified"), and the ones this run actually accepted. The first
-    # is what _stale_feed_validator compares against; the second is published
-    # in metadata.json so the next run has a baseline in turn.
+    # is the reference for assert_feed_fresh; the second is published in
+    # metadata.json so the next run has a baseline in turn. Empty disables the
+    # freshness check, the same way empty baseline_year_counts disables the
+    # sanity floor.
     baseline_feed_timestamps: dict[str, datetime] = field(default_factory=dict)
     feed_timestamps: dict[str, str] = field(default_factory=dict)
 
@@ -168,7 +188,12 @@ def resolve_user_agents() -> list[str]:
     return list(DEFAULT_USER_AGENTS)
 
 
-def build_crawler(api_key: str, allow_api_fallback: bool = True) -> Crawler:
+def build_crawler(
+    api_key: str,
+    allow_api_fallback: bool = True,
+    baseline_year_counts: dict[int, int] | None = None,
+    baseline_feed_timestamps: dict[str, datetime] | None = None,
+) -> Crawler:
     session = requests.Session()
     # An empty apiKey header makes the REST API return 404; only send it when
     # we actually have a key.
@@ -178,9 +203,110 @@ def build_crawler(api_key: str, allow_api_fallback: bool = True) -> Crawler:
         session=session,
         user_agents=resolve_user_agents(),
         allow_api_fallback=allow_api_fallback,
+        baseline_year_counts=dict(baseline_year_counts or {}),
+        baseline_feed_timestamps=dict(baseline_feed_timestamps or {}),
     )
     crawler.apply_user_agent()
     return crawler
+
+
+class TruncatedFeedError(ValueError):
+    """A feed whose contents fall short of what the feed itself promises.
+
+    On 2026-08-27 NIST began serving year files that were truncated at the
+    source with no transport-level symptom whatsoever: HTTP 200, a complete
+    and CRC-valid gzip stream, well-formed JSON, and an honest envelope --
+    nvdcve-2.0-2022.json.gz declared resultsPerPage=27531 above a
+    `vulnerabilities` array holding one record. Six years plus the modified
+    feed were serving 1-18 records each.
+
+    Nothing below this layer can see that, because nothing is broken; the file
+    simply contradicts itself. The old code logged it as `Fetched feed
+    year=2022 size=1` -- an ordinary success -- and the shortfall only
+    surfaced 25 feeds later as a 46.9% aggregate completeness ratio, with no
+    indication in the log of which years were responsible.
+
+    Subclasses ValueError so the fetch retry loop already catches it: a
+    truncated feed is a failed fetch, gets the host failover and the full
+    backoff ladder, and if it persists it is fatal for that year by name.
+    """
+
+
+def assert_feed_intact(payload: dict, min_records: int | None = None) -> None:
+    """Raise TruncatedFeedError if `payload` holds fewer records than expected.
+
+    Public because check_feeds.py watches the upstream feeds with the same
+    rule the scraper enforces; two copies of "intact" would drift.
+
+    Two independent floors, because they catch different failures:
+
+      1. The envelope's own count. Exact, needs no external reference, and
+         costs nothing -- the feed is compared against itself. Compared
+         against resultsPerPage (what this document promises) rather than
+         totalResults, so that if NVD ever starts paginating a year file the
+         check keeps passing instead of failing every fetch.
+      2. `min_records`, derived from the last published run. Catches a feed
+         that is internally consistent but grossly short -- the same failure
+         with a header that has caught up to the truncation, which floor 1 is
+         structurally unable to see.
+    """
+    if not isinstance(payload, dict):
+        return
+
+    actual = len(payload.get("vulnerabilities") or [])
+
+    promised = payload.get("resultsPerPage")
+    if isinstance(promised, int) and actual < promised:
+        raise TruncatedFeedError(
+            f"envelope promises {promised} records but the array holds {actual} "
+            f"({promised - actual} missing) -- truncated at the source"
+        )
+
+    if min_records is not None and actual < min_records:
+        raise TruncatedFeedError(
+            f"{actual} records is below the sanity floor of {min_records} for this "
+            f"feed, so it cannot be a complete copy"
+        )
+
+
+class StaleFeedError(ValueError):
+    """A feed build older than the one the last published run already used.
+
+    On 2026-09-11 a CDN edge replayed the previous day's 2026 year file: HTTP
+    200, intact gzip, well-formed JSON, and an envelope that agreed with its
+    own contents, so assert_feed_intact had nothing to catch -- a stale build
+    is a complete copy of the wrong day. It was 394 records short, and the
+    only thing that noticed was the coverage gate, 32 minutes of scraping
+    later, by which point the whole run was lost.
+
+    Subclasses ValueError for the same reason TruncatedFeedError does: the
+    fetch loop already catches it, so a stale copy becomes the failed fetch it
+    is and gets the host failover and the backoff ladder.
+    """
+
+
+def assert_feed_fresh(payload: dict, baseline_built_at: datetime | None) -> None:
+    """Raise StaleFeedError if `payload` predates the build we already used.
+
+    The comparison is against the build the last published run consumed, NOT
+    against that run's own clock. NIST rebuilds a year file only when its
+    contents change -- the 2003 feed served on 2026-09-11 was built on
+    2026-08-28 -- while this scraper runs every 3 hours regardless, so the
+    correct, current build is almost always older than the run that last used
+    it. Comparing against a run clock would reject every feed we fetch.
+
+    A missing baseline and an unreadable timestamp both mean "nothing to
+    compare", and neither may block a run that is otherwise fine.
+    """
+    if baseline_built_at is None:
+        return
+    built_at = feed_build_timestamp(payload)
+    if built_at is None or built_at >= baseline_built_at:
+        return
+    raise StaleFeedError(
+        f"build {built_at.isoformat()} predates the {baseline_built_at.isoformat()} "
+        f"build the last published run used -- a rolled-back copy, not new data"
+    )
 
 
 def looks_like_block(resp: requests.Response) -> bool:
@@ -211,6 +337,27 @@ def iter_feed_years(start_year: int = 2002, end_year: int | None = None):
 
 def feed_urls_for_year(year: int) -> list[str]:
     return [f"{base}/nvdcve-2.0-{year}.json.gz" for base in NVD_FEED_BASES]
+
+
+def expected_feed_size(year: int, baseline: dict[int, int]) -> int | None:
+    """Records the year `year` feed file should hold, per the published baseline.
+
+    Returns None when there is nothing to compare against. Accounts for the
+    2002 file aggregating every earlier year (see FIRST_FEED_YEAR).
+    """
+    if not baseline:
+        return None
+    if year <= FIRST_FEED_YEAR:
+        return sum(count for y, count in baseline.items() if y <= year) or None
+    return baseline.get(year)
+
+
+def feed_min_records(year: int, baseline: dict[int, int]) -> int | None:
+    """The fetch-time floor for a year feed, or None if it cannot be computed."""
+    expected = expected_feed_size(year, baseline)
+    if not expected:
+        return None
+    return int(expected * FEED_YEAR_MIN_RATIO)
 
 
 def modified_feed_urls() -> list[str]:
@@ -247,43 +394,8 @@ def feed_build_timestamp(payload: dict) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _stale_feed_validator(crawler: Crawler, key: str) -> Callable[[dict], str | None]:
-    """Reject a feed build older than the one the last published run used.
-
-    A stale CDN edge serves a previous day's build: valid gzip, valid JSON,
-    internally consistent totalResults -- and several hundred CVEs short. On
-    2026-09-11 that cost a run, because the only thing that noticed was the
-    coverage gate, by which point the feeds were already fetched and the whole
-    run had to be thrown away.
-
-    The comparison is per feed against the build the baseline consumed, NOT
-    against the baseline run's own clock. NIST rebuilds a year feed only when
-    something in it changed -- the 2003 feed served on 2026-09-11 was built on
-    2026-08-28 -- and this scraper runs every 3 hours regardless, so the
-    correct, current build is almost always older than the run that last used
-    it. Comparing against a run clock would reject every feed we fetch.
-    """
-
-    def validate(payload: dict) -> str | None:
-        built_at = feed_build_timestamp(payload)
-        baseline_built_at = crawler.baseline_feed_timestamps.get(key)
-        if built_at is None or baseline_built_at is None:
-            # No baseline (bootstrap, or metadata predating this field) and an
-            # unreadable timestamp both mean "nothing to compare", which must
-            # not block a run that is otherwise fine.
-            return None
-        if built_at < baseline_built_at:
-            return (
-                f"stale build {built_at.isoformat()} predates the "
-                f"{baseline_built_at.isoformat()} build the last published "
-                f"run used -- a rolled-back copy, not new data"
-            )
-        return None
-
-    return validate
-
-
 def _record_feed_timestamp(crawler: Crawler, key: str, payload: dict) -> None:
+    """Remember the build we accepted, so the next run can compare against it."""
     built_at = feed_build_timestamp(payload)
     if built_at is not None:
         crawler.feed_timestamps[key] = built_at.isoformat()
@@ -362,15 +474,16 @@ def _load_gzip_json_from_urls(
     max_attempts: int = MAX_FEED_RETRIES,
     base_backoff: float = FEED_BACKOFF_SECONDS,
     max_backoff: float = FEED_MAX_BACKOFF_SECONDS,
-    validate: Callable[[dict], str | None] | None = None,
+    min_records: int | None = None,
+    baseline_built_at: datetime | None = None,
 ) -> dict:
     """Fetch and parse a gzipped JSON feed, trying every host then retrying.
 
-    `validate` sees each parsed payload and returns a rejection reason to have
-    it treated as a failed fetch, or None to accept it. A payload that parses
-    is not necessarily the payload we want, and routing the bad ones through
-    this function's existing host-failover and backoff gives a stale or broken
-    edge a chance to be bypassed rather than losing the run.
+    A payload that parses is not necessarily the payload we want: it can be
+    truncated at the source (assert_feed_intact) or a stale replay of an older
+    build (assert_feed_fresh). Both are checked here so that a bad copy is
+    treated as a failed fetch and gets the host failover and the backoff
+    ladder, rather than reaching the caller as a thin success.
     """
     last_exc = None
 
@@ -390,11 +503,13 @@ def _load_gzip_json_from_urls(
                     resp.raw.decode_content = False
                     with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
                         payload = json.load(gz_stream)
-                rejection = validate(payload) if validate else None
-                if rejection is None:
+                    # Inside the try on purpose: a feed that is truncated at
+                    # the source or replayed from an older build is a failed
+                    # fetch, so it belongs to the retry ladder and the host
+                    # failover, not to the caller as a thin success.
+                    assert_feed_intact(payload, min_records)
+                    assert_feed_fresh(payload, baseline_built_at)
                     return payload
-                log.warning("%s rejected from %s: %s", label, url, rejection)
-                last_exc = RuntimeError(rejection)
             except (
                 OSError,
                 requests.RequestException,
@@ -410,7 +525,7 @@ def _load_gzip_json_from_urls(
             time.sleep(delay)
 
     raise RuntimeError(
-        f"Feed fetch failed for {label} after {max_attempts} attempts"
+        f"Feed fetch failed for {label} after {max_attempts} attempts: {last_exc}"
     ) from last_exc
 
 
@@ -543,13 +658,15 @@ def fetch_feed(
     year: int,
 ) -> list[dict]:
     urls = feed_urls_for_year(year)
-    log.info("Fetching feed year=%s", year)
+    min_records = feed_min_records(year, crawler.baseline_year_counts)
+    log.info("Fetching feed year=%s (floor=%s)", year, min_records)
     try:
         payload = _load_gzip_json_from_urls(
             crawler,
             urls,
             f"feed year={year}",
-            validate=_stale_feed_validator(crawler, str(year)),
+            min_records=min_records,
+            baseline_built_at=crawler.baseline_feed_timestamps.get(str(year)),
         )
         _record_feed_timestamp(crawler, str(year), payload)
         vulnerabilities = payload.get("vulnerabilities", [])
@@ -566,7 +683,7 @@ def fetch_feed(
                 f"Feed fetch failed for year={year} and the REST API fallback is "
                 f"disabled: the API partitions by publication date, not CVE-ID "
                 f"year, so substituting it would silently drop every "
-                f"CVE-{year}-* record published in a later year"
+                f"CVE-{year}-* record published in a later year. Cause: {feed_exc}"
             ) from feed_exc
         log.warning(
             "Feed failed for year=%s (%s) -- falling back to REST API", year, feed_exc
@@ -582,7 +699,7 @@ def fetch_modified_feed(crawler: Crawler) -> list[dict]:
         crawler,
         urls,
         "modified feed",
-        validate=_stale_feed_validator(crawler, "modified"),
+        baseline_built_at=crawler.baseline_feed_timestamps.get("modified"),
     )
     _record_feed_timestamp(crawler, "modified", payload)
     vulnerabilities = payload.get("vulnerabilities", [])
@@ -864,52 +981,61 @@ def main() -> int:
     allow_api_fallback = (
         not full_corpus_run or os.environ.get("NVD_ALLOW_API_FALLBACK", "").strip() == "1"
     )
-    crawler = build_crawler(api_key, allow_api_fallback=allow_api_fallback)
-
-    # Read the baseline before fetching anything. It carries the feed build
-    # timestamps the last published run consumed, which fetch_feed needs in
-    # order to recognise a rolled-back feed while there is still time to retry
-    # another host -- and reading it up front also fails a missing-baseline run
-    # in seconds rather than after a half-hour scrape.
+    # Read the last published run's metadata before crawling anything. It
+    # serves two purposes and both want it early: it is the reference for the
+    # per-year coverage gate at the end, and it sets the per-feed sanity floor
+    # applied as each year lands. Fetching it here also means a missing
+    # baseline -- fatal for a full-corpus run -- costs a few seconds instead
+    # of aborting after a completed 30-minute crawl.
     baseline_metadata: dict = {}
     if full_corpus_run:
         published = fetch_baseline_metadata()
-        if published is None:
-            if os.environ.get("NVD_ALLOW_MISSING_BASELINE", "").strip() == "1":
-                log.warning(
-                    "Baseline metadata unavailable; regression check disabled by "
-                    "NVD_ALLOW_MISSING_BASELINE"
-                )
-            else:
-                log.error(
-                    "Aborting: baseline metadata unavailable, so a regression "
-                    "against the published snapshot cannot be ruled out"
-                )
-                log.error(
-                    "Set NVD_ALLOW_MISSING_BASELINE=1 to publish anyway "
-                    "(bootstrap only)"
-                )
-                return 8
-        else:
+        if published is not None:
             baseline_metadata = published
-        # Off switch, separate from NVD_ALLOW_MISSING_BASELINE so that
-        # clearing a wedged freshness check does not also stand down the
-        # coverage gate. Needed if NIST ever republishes a feed with an
-        # earlier timestamp than the one we already consumed: every run would
-        # otherwise refuse that feed until the timestamp caught up.
-        if os.environ.get("NVD_SKIP_FEED_FRESHNESS", "").strip() == "1":
+        elif os.environ.get("NVD_ALLOW_MISSING_BASELINE", "").strip() == "1":
             log.warning(
-                "Feed freshness check disabled by NVD_SKIP_FEED_FRESHNESS -- a "
-                "rolled-back feed will only be caught after the scrape, by the "
-                "coverage gate"
+                "Baseline metadata unavailable; regression check disabled by "
+                "NVD_ALLOW_MISSING_BASELINE"
             )
         else:
-            crawler.baseline_feed_timestamps = baseline_feed_timestamps(baseline_metadata)
+            log.error(
+                "Aborting: baseline metadata unavailable, so a regression "
+                "against the published snapshot cannot be ruled out"
+            )
+            log.error(
+                "Set NVD_ALLOW_MISSING_BASELINE=1 to publish anyway (bootstrap only)"
+            )
+            return 8
+
+    baseline = baseline_year_counts(baseline_metadata)
+    # The same manifest also carries the build timestamp of every feed that run
+    # consumed, which is what assert_feed_fresh compares against. Off switch is
+    # separate from NVD_ALLOW_MISSING_BASELINE so that clearing a wedged
+    # freshness check does not also stand down the coverage gate -- needed if
+    # NIST ever republishes a feed with an earlier timestamp than the one we
+    # already used, which would otherwise refuse that feed on every run.
+    if os.environ.get("NVD_SKIP_FEED_FRESHNESS", "").strip() == "1":
+        log.warning(
+            "Feed freshness check disabled by NVD_SKIP_FEED_FRESHNESS -- a "
+            "rolled-back feed will only be caught after the scrape, by the "
+            "coverage gate"
+        )
+        baseline_builds: dict[str, datetime] = {}
+    else:
+        baseline_builds = baseline_feed_timestamps(baseline_metadata)
+        if full_corpus_run:
             log.info(
                 "Freshness baseline: %s feed build timestamps from the last "
                 "published run",
-                len(crawler.baseline_feed_timestamps),
+                len(baseline_builds),
             )
+
+    crawler = build_crawler(
+        api_key,
+        allow_api_fallback=allow_api_fallback,
+        baseline_year_counts=baseline,
+        baseline_feed_timestamps=baseline_builds,
+    )
 
     log.info(
         "Fetching NVD feeds for years %s-%s (api_fallback=%s)",
@@ -956,33 +1082,21 @@ def main() -> int:
         log.error("Scrape produced 0 CVEs -- aborting")
         return 4
 
-    # Completeness check: compare against the API's reported total. Only fails
-    # on a gross shortfall, so a flaky probe (returns None) never blocks a run,
-    # and only for a full-corpus run where the global total is the right
-    # expectation.
-    expected_total = fetch_total(crawler)
-    if expected_total and full_corpus_run:
-        ratio = cve_count / expected_total
-        if ratio < COMPLETENESS_MIN_RATIO:
-            log.error(
-                "Scrape incomplete: got %s CVEs, API reports %s total (%.1f%%) -- aborting",
-                cve_count,
-                expected_total,
-                100.0 * ratio,
-            )
-            return 5
-        log.info(
-            "Completeness: %s/%s CVEs (%.2f%%)", cve_count, expected_total, 100.0 * ratio
-        )
-
     # Coverage gate: hard non-regression against the last published run, per
     # year and on the total (see YEAR_DROP_ALLOWANCE). Catches both a single
     # lost year that the global ratio can't see and a shortfall spread too
     # thinly to trip any one year. Only meaningful for a full-corpus run -- a
     # restricted range legitimately omits years. Failing here returns before
     # the upload step, so the last-known-good data in R2 is left untouched.
+    #
+    # Ordered ahead of the global completeness ratio deliberately. Both gates
+    # would fail a short scrape, but this one says which years are short and by
+    # how much, where the ratio only says "46.9%" -- which is what the
+    # 2026-08-27 truncated-feed outage actually printed, leaving the affected
+    # years to be picked out of 26 "Fetched feed" lines by hand. Neither gate
+    # is weakened by the swap; both still run, and both still return before the
+    # upload step.
     if full_corpus_run:
-        baseline = baseline_year_counts(baseline_metadata)
         baseline_total = baseline_metadata.get("cve_count")
         if not isinstance(baseline_total, int):
             baseline_total = None
@@ -1002,6 +1116,25 @@ def main() -> int:
             max(year_counts),
             f", none shrinking vs {len(baseline)} baseline years" if baseline else "",
             f", total {cve_count} >= baseline {baseline_total}" if baseline_total else "",
+        )
+
+    # Completeness check: compare against the API's reported total. Only fails
+    # on a gross shortfall, so a flaky probe (returns None) never blocks a run,
+    # and only for a full-corpus run where the global total is the right
+    # expectation.
+    expected_total = fetch_total(crawler)
+    if expected_total and full_corpus_run:
+        ratio = cve_count / expected_total
+        if ratio < COMPLETENESS_MIN_RATIO:
+            log.error(
+                "Scrape incomplete: got %s CVEs, API reports %s total (%.1f%%) -- aborting",
+                cve_count,
+                expected_total,
+                100.0 * ratio,
+            )
+            return 5
+        log.info(
+            "Completeness: %s/%s CVEs (%.2f%%)", cve_count, expected_total, 100.0 * ratio
         )
 
     # Duplicate for consumer compatibility (see design §4)
