@@ -33,6 +33,7 @@ The dataset is assembled from two NIST sources:
   "sha256": "…",
   "cve_count": 378606,
   "year_counts": { "1999": 1579, "…": 0 },
+  "feed_timestamps": { "2026": "2026-08-17T03:00:01+00:00", "modified": "…" },
   "degraded": false,
   "years_via_api": [],
   "expected_total": 378675,
@@ -48,6 +49,7 @@ Fetch the manifest before the 1.8 GB object and refuse to ingest a snapshot that
 
 - `cve_count` and every entry in `year_counts` should be at or above the last values you accepted. Genuine CVE rejections move these by a handful of records; a drop of hundreds means a bad snapshot.
 - `degraded` should be `false` and `years_via_api` empty.
+- `feed_timestamps` records the build time of each NIST feed the run consumed. The next run refuses any feed built before these, which is how a CDN edge replaying an older build gets caught at fetch time rather than after the scrape.
 - `sha256` and `bytes` let you verify the object end to end once you have it.
 
 `check_mirror.py` in this repo does exactly that and can be run by anyone:
@@ -68,7 +70,7 @@ A run publishes only if every one of these holds. Any failure returns before the
 |---|---|---|
 | Baseline manifest readable | A silently skipped regression check | 8 |
 | Modified feed fetched and intact | NIST 404s the feed mid-regeneration, or serves it truncated; publishing without it drops the whole leading edge | 7 |
-| Year feeds fetched and intact, no REST API substitution | A missing or truncated year feed. No API substitution: the API partitions by publication date, not CVE-ID year, so it silently drops records published in a later year | 3 |
+| Year feeds fetched, intact, and not a stale replay, no REST API substitution | A missing, truncated, or rolled-back year feed. No API substitution: the API partitions by publication date, not CVE-ID year, so it silently drops records published in a later year | 3 |
 | Per-year and total non-regression vs the published snapshot | Any shrink beyond a small reject allowance | 6 |
 | Completeness ratio vs the API's reported total | Gross shortfall the per-year gate somehow missed | 5 |
 | `verify_manifest.py`: SHA-256, size vs manifest, array shape, `nvd.jsonl` matches, not degraded, above both the absolute and the relative size floor | A truncated or mismatched upload | 1 |
@@ -88,6 +90,18 @@ That copy used to be logged as `Fetched feed year=2022 size=1`, an ordinary succ
 
 The per-year gate is ordered ahead of the global completeness ratio on purpose. Both would fail a short scrape, but the per-year gate says which years are short and by how much, where the ratio only says `46.9%`.
 
+### Feed freshness
+
+Intact is not the same as current. On 2026-09-11 a CDN edge replayed the previous day's `nvdcve-2.0-2026.json.gz`: HTTP 200, intact gzip, and an envelope that agreed with its own contents, so neither floor above had anything to catch — a stale build is a *complete* copy of the wrong day. It was 394 records short. Both retry attempts read the identical 55,867, and 2022 and 2025 were each one short as well, so it was one edge replaying a whole set of day-old files rather than a truncated download. Only the per-year gate noticed, after a 32-minute scrape, and the run was lost.
+
+Every feed carries the time NIST generated it. `metadata.json` records the build each run consumed, per feed, and the next run refuses anything older — as a failed fetch, so it gets the same host failover and retry ladder, and the stale edge is usually just bypassed.
+
+The comparison is per feed against **the build the last published run consumed**, not against that run's own clock. NIST rebuilds a year file only when its contents change — the 2003 feed served on 2026-09-11 was built on 2026-08-28 — while this scraper runs every three hours regardless, so the correct, current build is almost always older than the run that last used it. Comparing against a run clock would reject every feed fetched.
+
+This is a different mechanism from the `Last-Modified`/`ETag` check ruled out above for the published mirror: that one watches HTTP metadata on our own object, where a regression arrives correctly stamped and merely short. This one reads the upstream feed's own `timestamp` field, which describes the build rather than the transfer.
+
+No baseline, an unreadable timestamp, and metadata predating `feed_timestamps` all leave the check inert rather than blocking a run. `NVD_SKIP_FEED_FRESHNESS=1` disables it without standing down the other gates, for the one case that could wedge the pipeline: NIST republishing a feed with an *earlier* timestamp than the one already consumed.
+
 ### Environment overrides
 
 | Variable | Default | Effect |
@@ -97,6 +111,7 @@ The per-year gate is ordered ahead of the global completeness ratio on purpose. 
 | `NVD_INCLUDE_MODIFIED_OVERLAY` | `1` | Set `0` to skip the overlay. A full-corpus run will then fail the non-regression gate, because skipping the overlay is precisely the bug these gates exist to stop |
 | `NVD_ALLOW_API_FALLBACK` | off for full-corpus runs | `1` re-enables the REST API fallback. A full-corpus run will still be stopped by the non-regression gate and by `verify_manifest.py`'s `degraded` check, so this is only useful with a restricted range |
 | `NVD_ALLOW_MISSING_BASELINE` | unset | `1` publishes without a baseline (bootstrap only) |
+| `NVD_SKIP_FEED_FRESHNESS` | unset | `1` stops rejecting feeds built before the ones the last published run used. Only needed if NIST republishes a feed with an earlier timestamp, which would otherwise wedge every run. Leaves the coverage gate in place |
 | `BASELINE_METADATA_URL` | the public manifest | Where to read the previous run's counts |
 | `NVD_USER_AGENT` | rotating pool | Override the User-Agent |
 
