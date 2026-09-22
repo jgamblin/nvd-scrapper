@@ -291,7 +291,7 @@ def assert_feed_fresh(payload: dict, baseline_built_at: datetime | None) -> None
     The comparison is against the build the last published run consumed, NOT
     against that run's own clock. NIST rebuilds a year file only when its
     contents change -- the 2003 feed served on 2026-09-11 was built on
-    2026-08-28 -- while this scraper runs every 3 hours regardless, so the
+    2026-08-28 -- while this scraper runs every hour regardless, so the
     correct, current build is almost always older than the run that last used
     it. Comparing against a run clock would reject every feed we fetch.
 

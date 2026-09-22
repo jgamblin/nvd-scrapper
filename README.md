@@ -96,7 +96,7 @@ Intact is not the same as current. On 2026-09-11 a CDN edge replayed the previou
 
 Every feed carries the time NIST generated it. `metadata.json` records the build each run consumed, per feed, and the next run refuses anything older — as a failed fetch, so it gets the same host failover and retry ladder, and the stale edge is usually just bypassed.
 
-The comparison is per feed against **the build the last published run consumed**, not against that run's own clock. NIST rebuilds a year file only when its contents change — the 2003 feed served on 2026-09-11 was built on 2026-08-28 — while this scraper runs every three hours regardless, so the correct, current build is almost always older than the run that last used it. Comparing against a run clock would reject every feed fetched.
+The comparison is per feed against **the build the last published run consumed**, not against that run's own clock. NIST rebuilds a year file only when its contents change — the 2003 feed served on 2026-09-11 was built on 2026-08-28 — while this scraper runs every hour regardless, so the correct, current build is almost always older than the run that last used it. Comparing against a run clock would reject every feed fetched.
 
 This is a different mechanism from the `Last-Modified`/`ETag` check ruled out above for the published mirror: that one watches HTTP metadata on our own object, where a regression arrives correctly stamped and merely short. This one reads the upstream feed's own `timestamp` field, which describes the build rather than the transfer.
 
