@@ -710,7 +710,7 @@ def test_assert_feed_fresh_accepts_the_same_daily_build_again():
 
     NIST rebuilds a year file only when its contents change -- the 2003 feed
     served on 2026-09-11 was built on 2026-08-28 -- while this scraper runs
-    every 3 hours regardless. The correct, current build is therefore almost
+    every hour regardless. The correct, current build is therefore almost
     always older than the run that last used it, and comparing against a run
     clock would reject every feed we fetch.
     """

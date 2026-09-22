@@ -6,7 +6,7 @@
     <title>nvd.handsonhacking.org</title>
     <meta
       name="description"
-      content="Public mirror of the full NVD CVE dataset, refreshed every 3 hours."
+      content="Public mirror of the full NVD CVE dataset, rebuilt hourly."
     />
     <style>
       :root {
@@ -113,7 +113,9 @@
     <main>
       <h1>nvd.handsonhacking.org</h1>
       <p class="lede">
-        Public mirror of the full NVD CVE dataset, refreshed every 3 hours.
+        Public mirror of the full NVD CVE dataset, rebuilt hourly.
+        <code>metadata.json</code> carries the exact build time of the
+        snapshot currently being served.
       </p>
 
       <h2>Endpoints</h2>

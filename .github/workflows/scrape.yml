@@ -2,9 +2,17 @@ name: scrape-and-publish
 
 on:
   schedule:
-    # Every 3 hours. Public-repo scheduled runs can be skipped under GitHub
-    # load; 3h cadence plus a 12h healthchecks.io grace absorbs typical skips.
-    - cron: "0 */3 * * *"
+    # Hourly, at :38 rather than :00. Public-repo scheduled runs are dropped
+    # under GitHub load, and the top of the hour is the most contended minute
+    # on the platform, so an off-peak minute improves delivery for free. On
+    # minute 0 at a 3h cadence this delivered ~5.5 of 8 requested runs/day.
+    #
+    # The healthchecks.io period should be set to 1h to match. Its grace stays
+    # at 12h: the long gaps are wall-clock GitHub scheduling outages, not
+    # independent per-attempt drops, so they do not shrink with cadence. Over
+    # six weeks at 3-hourly the gap distribution was median 3.1h / p90 5.8h /
+    # max 14.5h, and a tighter grace would fire on outages already tolerated.
+    - cron: "38 * * * *"
   workflow_dispatch:
 
 permissions:
