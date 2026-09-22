@@ -18,9 +18,12 @@ name: monitor-mirror
 
 on:
   schedule:
-    # Hourly gives ~3 observations per 3-hourly publish, which is enough to
-    # catch a bad snapshot well before the next one replaces it.
-    - cron: "17 * * * *"
+    # Twice an hour. The scrape publishes hourly, so an hourly check would
+    # sample it 1:1 and a bad snapshot could come and go unobserved between
+    # two checks. :17/:47 keeps ~2 observations per publish, which is what
+    # makes a regression visible while it is still the live object. Both
+    # slots avoid the scraper's :38 and the contended top of the hour.
+    - cron: "17,47 * * * *"
   workflow_dispatch:
 
 permissions:

@@ -7,7 +7,7 @@ Public NVD CVE mirror served at <https://nvd.handsonhacking.org/>.
 
 ## What this is
 
-Every three hours, GitHub Actions runs `nvd.py`, which pulls the full NVD 2.0 dataset and uploads `nvd.json` and `nvd.jsonl` (both JSON arrays, byte-identical) to a Cloudflare R2 bucket. The bucket is exposed at `nvd.handsonhacking.org` via Cloudflare's R2 custom-domain feature.
+Every hour, GitHub Actions runs `nvd.py`, which pulls the full NVD 2.0 dataset and uploads `nvd.json` and `nvd.jsonl` (both JSON arrays, byte-identical) to a Cloudflare R2 bucket. The bucket is exposed at `nvd.handsonhacking.org` via Cloudflare's R2 custom-domain feature.
 
 The dataset is assembled from two NIST sources:
 
