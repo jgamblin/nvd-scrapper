@@ -1,0 +1,27 @@
+# Hourly trigger for .github/workflows/scrape.yml. GitHub's own scheduler
+# dropped most hourly runs outright (see the comment on scrape.yml's
+# schedule), while Cloudflare cron triggers fire on time, so this Worker owns
+# the cadence and GitHub's cron is only a daily fallback.
+name = "nvd-scrape-trigger"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+# Cron-only: there is no fetch handler, so do not expose a workers.dev URL.
+# Test locally with `npx wrangler dev --test-scheduled` (see README.md).
+workers_dev = false
+
+[triggers]
+# UTC. :38 stays clear of the contended top of the hour and of monitor.yml's
+# :17/:47 checks.
+crons = ["38 * * * *"]
+
+# Keep invocation logs so a non-204 from GitHub is visible after the fact.
+[observability]
+enabled = true
+
+[vars]
+GITHUB_REPO = "jgamblin/nvd-scrapper"
+WORKFLOW_FILE = "scrape.yml"
+WORKFLOW_REF = "main"
+
+# GITHUB_TOKEN is a secret, not a var: npx wrangler secret put GITHUB_TOKEN
