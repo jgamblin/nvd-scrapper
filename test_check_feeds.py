@@ -214,3 +214,59 @@ def test_modified_feed_truncation_is_a_finding():
 
     assert len(problems) == 1
     assert "7842" in problems[0] and "551" in problems[0]
+
+
+def test_a_truncated_gzip_stream_is_a_note_not_a_finding():
+    """A gzip stream cut short raises EOFError, which is not an OSError. On
+    2026-09-23 that escaped, crashed the check with exit 1, and opened an
+    upstream-feeds issue for what was only a short read."""
+    import gzip
+    import io
+    import json
+
+    body = io.BytesIO()
+    with gzip.GzipFile(fileobj=body, mode="wb") as gz:
+        gz.write(json.dumps({"vulnerabilities": []}).encode())
+    raw = io.BytesIO(body.getvalue()[:-12])
+    raw.decode_content = False
+
+    class Resp:
+        status_code = 200
+        headers = {"Content-Type": "application/gzip"}
+
+        def __init__(self):
+            self.raw = raw
+
+        def raise_for_status(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    class Session:
+        headers: dict = {}
+
+        def get(self, url, **kwargs):
+            return Resp()
+
+    crawler = nvd.Crawler(session=Session(), user_agents=["ua"])
+    problems, notes = check_feeds.check_modified_feed(crawler)
+
+    assert problems == []
+    assert any("EOFError" in n for n in notes)
+
+
+def test_main_exits_2_when_the_check_itself_crashes(monkeypatch):
+    """A crash would otherwise exit 1 and be filed as an upstream outage."""
+    monkeypatch.setattr(check_feeds, "fetch_baseline_year_counts", lambda url: {2026: 1})
+    monkeypatch.setattr(check_feeds.nvd, "build_crawler", lambda key: object())
+
+    def boom(*a, **k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(check_feeds, "check_year_feeds", boom)
+
+    assert check_feeds.main([]) == 2
