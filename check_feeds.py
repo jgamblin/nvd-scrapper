@@ -43,6 +43,8 @@ import gzip
 import json
 import os
 import sys
+import traceback
+import zlib
 
 import requests
 
@@ -167,10 +169,16 @@ def check_modified_feed(crawler: nvd.Crawler) -> tuple[list[str], list[str]]:
                 resp.raw.decode_content = False
                 with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
                     payload = json.load(gz_stream)
-        except (OSError, requests.RequestException, ValueError) as exc:
+        except (
+            OSError, EOFError, zlib.error, requests.RequestException, ValueError
+        ) as exc:
             # Unreachable, 404 mid-regeneration, a truncated gzip stream: all
             # upstream weather the scraper's retry ladder is built to ride out,
-            # so none of it is this watchdog's finding.
+            # so none of it is this watchdog's finding. EOFError (a gzip cut
+            # short) and zlib.error (a corrupt deflate stream) are listed
+            # separately because neither is an OSError -- missing them let a
+            # short read on 2026-09-23 crash the check, and the crash's exit
+            # code 1 was reported as NIST serving incomplete feeds.
             notes.append(f"modified feed: not evaluated ({type(exc).__name__}: {exc})")
             continue
 
@@ -189,6 +197,21 @@ def check_modified_feed(crawler: nvd.Crawler) -> tuple[list[str], list[str]]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the check, mapping any unexpected crash to exit 2.
+
+    An uncaught exception would exit 1, which the workflow reads as "NIST is
+    serving incomplete feeds" and files an issue for. A bug in this script is
+    not evidence about upstream, so it must land on "could not evaluate".
+    """
+    try:
+        return _run(argv)
+    except Exception:
+        traceback.print_exc()
+        print("check_feeds crashed; upstream health not evaluated", file=sys.stderr)
+        return 2
+
+
+def _run(argv: list[str] | None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=DEFAULT_BASELINE_URL)
     parser.add_argument("--start-year", type=int, default=nvd.FIRST_FEED_YEAR)

@@ -136,10 +136,18 @@ jobs:
         id: feeds
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-        run: python3 check_feeds.py
+        # Exit 1 means degraded feeds; exit 2 means the check could not run.
+        # Only the former is an upstream finding, so the code is kept for the
+        # issue step rather than letting any failure file an issue.
+        run: |
+          set +e
+          python3 check_feeds.py
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
 
       - name: Open or update upstream issue
-        if: failure() && steps.feeds.outcome == 'failure'
+        if: failure() && steps.feeds.outputs.code == '1'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
