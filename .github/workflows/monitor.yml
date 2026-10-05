@@ -1,6 +1,6 @@
 name: monitor-mirror
 
-# Two independent watchdogs, one schedule.
+# Three independent watchdogs, one schedule.
 #
 # `check` watches what we published: fetches the ~2 KB metadata.json and fails
 # if cve_count or any per-year count has fallen below the best value ever
@@ -15,6 +15,10 @@ name: monitor-mirror
 # serving junk for a day. On 2026-08-27 it served year feeds that were HTTP
 # 200 with intact gzip over a near-empty array, and this job is what turns
 # that into "NIST is broken" rather than a stack of failed scrape runs.
+#
+# `freshness` watches how current the data is: data_current_through in the
+# manifest, which a run publishing on time can still leave hours behind if
+# the API delta keeps failing. See check_freshness.py.
 
 on:
   schedule:
@@ -181,5 +185,75 @@ jobs:
           for n in $(gh issue list --state open --label upstream-feeds \
             --json number --jq '.[].number'); do
             gh issue comment "$n" --body "Recovered: every upstream feed is back above the completeness floor. $RUN_URL"
+            gh issue close "$n"
+          done
+
+  # Separate from `check` for the same reasons `upstream` is: a stale mirror
+  # and a regressed one want different responses, and a failure here must not
+  # stop `check` saving its high-water marks. Stale is not wrong -- every
+  # publish gate still holds -- it means the API delta has been failing, or
+  # NIST has stopped rebuilding the modified feed, or publishing has stopped.
+  freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check mirror freshness
+        id: fresh
+        # Exit 1 means stale; exit 2 means the check could not run. Only the
+        # former files an issue, as in `upstream`.
+        run: |
+          set +e
+          python3 check_freshness.py
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Open or update stale-data issue
+        if: failure() && steps.fresh.outputs.code == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create mirror-stale --color FBCA04 \
+            --description "Automated: published data is falling behind NVD" --force || true
+          ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          body=$(printf '%s\n\n%s\n%s\n\n%s\n%s' \
+            "The published snapshot's data_current_through is more than 3 hours behind." \
+            "When (UTC): $ts" \
+            "Run log: $RUN_URL (shows the lag and the api_delta status)" \
+            "The data is still correct -- every publish gate holds -- just old. Check the latest scrape run for an 'API delta skipped' warning; if there is none and runs are succeeding, NIST has likely stopped rebuilding the modified feed." \
+            "No action is needed if the API is simply down: runs keep publishing feed-only data, and this closes itself when the delta recovers.")
+          existing="$(gh issue list --state open --label mirror-stale \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Published data is falling behind NVD" \
+              --label mirror-stale --body "$body"
+          fi
+
+      - name: Close stale-data issue on recovery
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --state open --label mirror-stale \
+            --json number --jq '.[].number'); do
+            gh issue comment "$n" --body "Recovered: the mirror is back within 3 hours of NVD. $RUN_URL"
             gh issue close "$n"
           done

@@ -15,7 +15,7 @@ The dataset is assembled from two NIST sources:
 - **The `modified` feed**, a rolling window of recently changed records. This is the *only* feed carrying CVEs published since NIST's last year-feed rebuild, so it supplies the leading edge of the dataset.
 - **An NVD REST API delta**: every record modified since the newest change in the modified feed. NIST rebuilds that feed every 2 hours by day and every 5 overnight (observed 2026-10-04/05: 20:00, 01:00, 06:00 ET), so on its own the leading edge lagged NVD by up to six hours. The delta brings that down to the run cadence.
 
-The delta is **strictly optional**. This pipeline left the API once already, after an unstable stretch left weeks of runs unfinished, so the delta gets a hard wall-clock budget (`NVD_API_DELTA_BUDGET_SECONDS`, default 300, every retry included) and is all-or-nothing. On any failure the run publishes the feed-only snapshot, exactly as before, records `api_delta.status: "failed"` in the manifest, and raises a warning annotation on the workflow run. It is never `degraded` and never fails a run. The `totalResults` probe used by the completeness gate is bounded the same way (60 s).
+The delta is **strictly optional**. This pipeline left the API once already, after an unstable stretch left weeks of runs unfinished, so the delta gets a hard wall-clock budget (`NVD_API_DELTA_BUDGET_SECONDS`, default 300, every retry included). Response bodies are read against that deadline too, so a server trickling bytes can overrun it by at most one 60 s request timeout. The delta is all-or-nothing. On any failure the run publishes the feed-only snapshot, exactly as before, records `api_delta.status: "failed"` in the manifest, and raises a warning annotation on the workflow run. It is never `degraded` and never fails a run. The `totalResults` probe used by the completeness gate is bounded the same way (60 s).
 
 When a CVE appears in more than one source, the copy with the latest `lastModified` wins. Precedence is not by source: year feeds rebuild at 03:00 ET while the modified feed can sit on its 01:00 build until 06:00, so a year feed is sometimes the newer one.
 
@@ -129,12 +129,15 @@ No baseline, an unreadable timestamp, and metadata predating `feed_timestamps` a
 
 ## Monitoring
 
-Two watchdogs run every 30 minutes from `monitor.yml`, as separate jobs, because they answer different questions and want different responses.
+Three watchdogs run every 30 minutes from `monitor.yml`, as separate jobs, because they answer different questions and want different responses.
 
 | Script | Watches | Fails when |
 |---|---|---|
 | [`check_mirror.py`](check_mirror.py) | the snapshot we publish | `cve_count` or any per-year count drops below the best value ever observed, or the snapshot is flagged `degraded` |
 | [`check_feeds.py`](check_feeds.py) | NIST's upstream feeds | a feed is served but holds far fewer records than it declares |
+| [`check_freshness.py`](check_freshness.py) | how current the published data is | `data_current_through` is more than 3 hours behind (`--max-lag-hours`) |
+
+`check_freshness.py` exists because the API delta is non-fatal by design, which makes it easy to lose without noticing: every run keeps succeeding, publishing feed-only data that is 1-6 hours old instead of under one. It watches `data_current_through`, not `last_run_iso`, since an on-time run can carry old data. The 3-hour default stays quiet through a single failed delta by day and fires once the delta has been failing for a while, or publishing has stopped. It opens its own `mirror-stale` issue, which closes itself on recovery.
 
 `check_feeds.py` exists because a healthy published snapshot looks identical whether NIST is fine or has been serving truncated feeds for a day -- the mirror watchdog stays green while every scrape run fails, which is correct but leaves "why" to be reconstructed from a failed run log. It opens its own `upstream-feeds` issue, distinct from `scrape-failure`, so a NIST fault is not read as a fault here.
 

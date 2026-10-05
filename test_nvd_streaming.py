@@ -1064,6 +1064,12 @@ class _ApiResponse:
     def json(self):
         return self._payload
 
+    def iter_content(self, chunk_size=1):
+        yield json.dumps(self._payload).encode()
+
+    def close(self):
+        pass
+
 
 class _ApiSession:
     """Serves API pages by startIndex, or runs `behaviour` per request."""
@@ -1076,8 +1082,8 @@ class _ApiSession:
         self.clock = clock
         self.calls = []
 
-    def get(self, url, params=None, timeout=None):
-        self.calls.append({"params": params, "timeout": timeout})
+    def get(self, url, params=None, timeout=None, stream=False):
+        self.calls.append({"params": params, "timeout": timeout, "stream": stream})
         if self.behaviour:
             return self.behaviour(self, params, timeout)
         start = params["startIndex"]
@@ -1151,6 +1157,32 @@ def test_a_dead_api_costs_the_budget_and_no_more(monkeypatch):
 
     assert clock.now - start <= 300
     assert all(c["timeout"] <= nvd.API_DELTA_REQUEST_TIMEOUT for c in session.calls)
+
+
+def test_a_trickling_response_cannot_outlast_the_budget(monkeypatch):
+    """A socket timeout only bounds the wait for the *next* byte. A server
+    sending one every few seconds never trips it, so the body is read against
+    the deadline as well."""
+    clock = _use_clock(monkeypatch)
+
+    class Trickle(_ApiResponse):
+        def iter_content(self, chunk_size=1):
+            while True:
+                clock.now += 5  # one byte every five seconds, forever
+                yield b" "
+
+    session = _ApiSession(behaviour=lambda s, p, t: Trickle({}))
+    start = clock.now
+
+    try:
+        nvd.fetch_api_delta(_api_crawler(session), _SINCE, _UNTIL, budget_seconds=300)
+    except nvd.ApiDeadlineError as exc:
+        assert "response body" in str(exc)
+    else:
+        raise AssertionError("expected the budget to cut the trickle off")
+
+    assert clock.now - start <= 300 + nvd.API_DELTA_REQUEST_TIMEOUT
+    assert len(session.calls) == 1  # a deadline is final, not retried
 
 
 def test_api_delta_retries_a_transient_error(monkeypatch):
