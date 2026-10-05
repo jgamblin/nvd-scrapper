@@ -643,10 +643,13 @@ def _fetch_api_page_bounded(
     """GET one API page, retrying until `deadline` (a time.monotonic() value).
 
     For API calls nothing depends on, the deadline is the only thing that
-    matters: every request timeout and backoff is clipped to the time left, so
-    the call returns or raises ApiDeadlineError by `deadline` no matter how the
-    API misbehaves. _fetch_api_page's ladder is for the year fallback, where
-    the run genuinely needs the data.
+    matters: every request timeout and backoff is clipped to the time left,
+    and the body is read against the deadline too (see _read_body_by), so the
+    call returns or raises ApiDeadlineError within one request timeout of
+    `deadline` however the API misbehaves -- including a response that keeps
+    trickling bytes, which a socket timeout alone never ends.
+    _fetch_api_page's ladder is for the year fallback, where the run genuinely
+    needs the data.
     """
     attempt = 0
     last_exc: Exception | None = None
@@ -659,19 +662,25 @@ def _fetch_api_page_bounded(
         attempt += 1
         try:
             resp = crawler.session.get(
-                url, params=params, timeout=min(API_DELTA_REQUEST_TIMEOUT, remaining)
+                url,
+                params=params,
+                timeout=min(API_DELTA_REQUEST_TIMEOUT, remaining),
+                stream=True,
             )
-            if looks_like_block(resp):
-                # Not worth a UA rotation: the pool is shared with the feeds,
-                # which matter far more than this call.
-                last_exc = RuntimeError(f"blocked HTTP {resp.status_code}")
-                log.warning("%s attempt %s appears blocked (HTTP %s)", label, attempt, resp.status_code)
-            else:
-                resp.raise_for_status()
-                data = resp.json()
-                if not isinstance(data, dict):
-                    raise ValueError("API response is not a JSON object")
-                return data
+            try:
+                if looks_like_block(resp):
+                    # Not worth a UA rotation: the pool is shared with the
+                    # feeds, which matter far more than this call.
+                    last_exc = RuntimeError(f"blocked HTTP {resp.status_code}")
+                    log.warning("%s attempt %s appears blocked (HTTP %s)", label, attempt, resp.status_code)
+                else:
+                    resp.raise_for_status()
+                    data = json.loads(_read_body_by(resp, deadline, label))
+                    if not isinstance(data, dict):
+                        raise ValueError("API response is not a JSON object")
+                    return data
+            finally:
+                resp.close()
         except (requests.RequestException, ValueError) as exc:
             last_exc = exc
             log.warning("%s attempt %s %s: %s", label, attempt, type(exc).__name__, exc)
@@ -679,6 +688,22 @@ def _fetch_api_page_bounded(
             last_exc, attempt, API_DELTA_BACKOFF_SECONDS, API_DELTA_BACKOFF_SECONDS * 8
         )
         time.sleep(max(0.0, min(delay, deadline - time.monotonic())))
+
+
+def _read_body_by(resp: requests.Response, deadline: float, label: str) -> bytes:
+    """Read a streamed response body, giving up at `deadline`.
+
+    The request timeout only bounds each wait for the next byte, so a server
+    that keeps a byte arriving every few seconds can hold a plain .json() call
+    open indefinitely. Checking the clock between chunks caps that at the
+    deadline plus one read timeout.
+    """
+    chunks = []
+    for chunk in resp.iter_content(chunk_size=64 * 1024):
+        if time.monotonic() > deadline:
+            raise ApiDeadlineError(f"{label}: out of time reading the response body")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _api_page_delay(crawler: Crawler) -> float:
