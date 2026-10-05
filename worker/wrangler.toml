@@ -1,4 +1,4 @@
-# Hourly trigger for .github/workflows/scrape.yml. GitHub's own scheduler
+# Half-hourly trigger for .github/workflows/scrape.yml. GitHub's own scheduler
 # dropped most hourly runs outright (see the comment on scrape.yml's
 # schedule), while Cloudflare cron triggers fire on time, so this Worker owns
 # the cadence and GitHub's cron is only a daily fallback.
@@ -11,9 +11,12 @@ compatibility_date = "2026-09-01"
 workers_dev = false
 
 [triggers]
-# UTC. :38 stays clear of the contended top of the hour and of monitor.yml's
-# :17/:47 checks.
-crons = ["38 * * * *"]
+# UTC, every 30 minutes. Half-hourly since the API delta (nvd.py): each run now
+# reads NVD's changes up to the minute, so cadence is what bounds the lag, not
+# NIST's 2-5 hour feed rebuilds. A run takes 4-16 minutes; the workflow's
+# concurrency group queues any overlap. :08/:38 stay clear of the contended
+# top of the hour and of monitor.yml's :28/:58 checks.
+crons = ["8,38 * * * *"]
 
 # Keep invocation logs so a non-204 from GitHub is visible after the fact.
 [observability]

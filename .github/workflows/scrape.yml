@@ -1,8 +1,8 @@
 name: scrape-and-publish
 
 on:
-  # The hourly trigger is NOT this file. It is the Cloudflare Worker in
-  # worker/, whose cron fires at :38 and calls the workflow_dispatch API
+  # The half-hourly trigger is NOT this file. It is the Cloudflare Worker in
+  # worker/, whose cron fires at :08 and :38 and calls the workflow_dispatch API
   # below. GitHub's own scheduler could not hold an hourly cadence: in the 19h
   # after moving from 3-hourly to hourly at :38 it created 5 runs, none at
   # :38, and none cancelled -- the events were simply never created. Moving
@@ -11,7 +11,7 @@ on:
   #
   # This schedule is only a daily fallback so the mirror still refreshes if
   # the Worker or its token breaks. It sits at an off-peak minute away from
-  # the Worker's :38; if the two ever coincide, the concurrency group below
+  # the Worker's :08/:38; if the two ever coincide, the concurrency group below
   # serialises them and the second run is a harmless idempotent re-scrape.
   #
   # healthchecks.io: period 1h, grace 3h. The 12h grace was sized for GitHub

@@ -14,7 +14,13 @@ Data path:
      leading edge. Losing it publishes a snapshot that looks internally
      complete but is hundreds of CVEs short, which is why it is fatal here
      rather than a warning.
-  3. NVD REST API (services.nvd.nist.gov) -- a per-year fallback that is
+  3. An NVD REST API delta, overlaid last: every record modified since the
+     newest change in the modified feed. NIST rebuilds that feed only every
+     two hours by day and every five overnight, so without this the leading
+     edge lags NVD by up to six hours. Strictly bounded and never fatal -- the
+     API is unstable enough to have stalled this pipeline for weeks before --
+     so on any failure the run publishes the feed-only snapshot.
+  4. NVD REST API (services.nvd.nist.gov) -- a per-year fallback that is
      DISABLED for full-corpus runs. The API can only be queried by publication
      date while the feeds partition by CVE-ID year, so substituting it drops
      every CVE-<year>-* record published in a later year. Set
@@ -36,6 +42,7 @@ import gzip
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 import urllib3.exceptions
@@ -97,7 +104,28 @@ FIRST_FEED_YEAR = 2002
 # against a published baseline of 21074, because a rejected CVE leaves the
 # feed while staying in our snapshot.
 FEED_YEAR_MIN_RATIO = 0.5
-# REST API: more patience since it's the last resort.
+# The clock NIST writes feed build timestamps in. They carry no offset, and
+# they are NOT UTC: on 2026-10-05 the modified feed's `timestamp` read
+# 06:00:03 while its .meta file said 06:00:05-04:00 and the HTTP
+# Last-Modified said 10:00:09 GMT. Record-level `lastModified` fields, in the
+# feeds and the API alike, are UTC -- only the feed envelope is local time.
+NIST_FEED_TZ = ZoneInfo("America/New_York")
+# API delta overlay (see apply_api_delta). The budget is wall-clock for the
+# whole delta, every page and retry included, and exhausting it only skips the
+# delta. The API has stalled this pipeline for weeks before; it must never be
+# able to do that again.
+API_DELTA_BUDGET_SECONDS = 300
+API_DELTA_REQUEST_TIMEOUT = 60
+API_DELTA_BACKOFF_SECONDS = 5
+# Re-read a little before the modified feed's newest change, so a record
+# written while NIST was building that feed cannot fall between the two.
+# Overlap is harmless: the newer lastModified wins either way.
+API_DELTA_OVERLAP = timedelta(minutes=15)
+# The best-effort totalResults probe gets a bound of its own for the same
+# reason. It used the fallback's retry ladder, which could spend ~27 minutes
+# on a dead API to fetch a number no run depends on.
+API_TOTAL_BUDGET_SECONDS = 60
+# REST API fallback: more patience since it's the last resort.
 MAX_API_RETRIES = 5
 RETRY_BACKOFF_SECONDS = 10
 API_MAX_BACKOFF_SECONDS = 120
@@ -291,7 +319,7 @@ def assert_feed_fresh(payload: dict, baseline_built_at: datetime | None) -> None
     The comparison is against the build the last published run consumed, NOT
     against that run's own clock. NIST rebuilds a year file only when its
     contents change -- the 2003 feed served on 2026-09-11 was built on
-    2026-08-28 -- while this scraper runs every hour regardless, so the
+    2026-08-28 -- while this scraper runs every half hour regardless, so the
     correct, current build is almost always older than the run that last used
     it. Comparing against a run clock would reject every feed we fetch.
 
@@ -372,7 +400,11 @@ def feed_build_timestamp(payload: dict) -> datetime | None:
     """Parse a feed payload's own build timestamp, as UTC.
 
     NIST stamps every feed with the time it was generated, e.g.
-    "2026-09-11T03:00:01.8043137" -- naive, but documented as UTC. Returns
+    "2026-09-11T03:00:01.8043137" -- naive, and in US Eastern time, not UTC
+    (see NIST_FEED_TZ). Manifests published before this was corrected carry
+    these values mislabelled +00:00, which reads as 4-5 hours *earlier* than
+    the truth, so comparing a correctly parsed build against one of them can
+    only err towards accepting it, never towards a false "stale". Returns
     None when the field is missing or unparseable, which callers must treat
     as "unknown" rather than "stale": an unreadable timestamp means NIST
     changed the format, not that the feed rolled back.
@@ -390,8 +422,45 @@ def feed_build_timestamp(payload: dict) -> datetime | None:
         log.warning("Feed timestamp %r is not ISO 8601; treating it as unknown", raw)
         return None
     if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=NIST_FEED_TZ)
+    return parsed.astimezone(timezone.utc)
+
+
+def record_last_modified(item: dict) -> datetime | None:
+    """A CVE record's own `lastModified`, as UTC, or None if unreadable.
+
+    Unlike the feed envelope's timestamp this field is UTC, and it is the same
+    value whether the record came from a feed or the API (checked 2026-10-05
+    against three CVEs present in both).
+    """
+    raw = (item.get("cve") or {}).get("lastModified")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    text = re.sub(r"(\.\d{6})\d+", r"\1", raw.strip())
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def is_newer_record(candidate: dict, current: dict) -> bool:
+    """True if `candidate` is a strictly later version of `current`.
+
+    Unreadable timestamps never win, so a record with a malformed date cannot
+    displace one we can vouch for.
+    """
+    new = record_last_modified(candidate)
+    old = record_last_modified(current)
+    return new is not None and (old is None or new > old)
+
+
+def newest_last_modified(items) -> datetime | None:
+    """The latest `lastModified` across `items`, or None if none is readable."""
+    stamps = [ts for ts in map(record_last_modified, items) if ts is not None]
+    return max(stamps, default=None)
 
 
 def _record_feed_timestamp(crawler: Crawler, key: str, payload: dict) -> None:
@@ -560,14 +629,173 @@ def _fetch_api_page(
     raise RuntimeError(f"API fetch failed for {label} after {MAX_API_RETRIES} attempts") from last_exc
 
 
-def fetch_total(crawler: Crawler) -> int | None:
+class ApiDeadlineError(RuntimeError):
+    """A bounded API call ran out of wall-clock budget."""
+
+
+def _fetch_api_page_bounded(
+    crawler: Crawler,
+    url: str,
+    params: dict,
+    label: str,
+    deadline: float,
+) -> dict:
+    """GET one API page, retrying until `deadline` (a time.monotonic() value).
+
+    For API calls nothing depends on, the deadline is the only thing that
+    matters: every request timeout and backoff is clipped to the time left, so
+    the call returns or raises ApiDeadlineError by `deadline` no matter how the
+    API misbehaves. _fetch_api_page's ladder is for the year fallback, where
+    the run genuinely needs the data.
+    """
+    attempt = 0
+    last_exc: Exception | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            raise ApiDeadlineError(
+                f"{label}: out of time after {attempt} attempt(s): {last_exc}"
+            ) from last_exc
+        attempt += 1
+        try:
+            resp = crawler.session.get(
+                url, params=params, timeout=min(API_DELTA_REQUEST_TIMEOUT, remaining)
+            )
+            if looks_like_block(resp):
+                # Not worth a UA rotation: the pool is shared with the feeds,
+                # which matter far more than this call.
+                last_exc = RuntimeError(f"blocked HTTP {resp.status_code}")
+                log.warning("%s attempt %s appears blocked (HTTP %s)", label, attempt, resp.status_code)
+            else:
+                resp.raise_for_status()
+                data = resp.json()
+                if not isinstance(data, dict):
+                    raise ValueError("API response is not a JSON object")
+                return data
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            log.warning("%s attempt %s %s: %s", label, attempt, type(exc).__name__, exc)
+        delay = _retry_delay_seconds(
+            last_exc, attempt, API_DELTA_BACKOFF_SECONDS, API_DELTA_BACKOFF_SECONDS * 8
+        )
+        time.sleep(max(0.0, min(delay, deadline - time.monotonic())))
+
+
+def _api_page_delay(crawler: Crawler) -> float:
+    # NVD's documented limits: 50 requests / 30s with a key, 5 without.
+    return API_PAGE_DELAY_SECONDS if crawler.session.headers.get("apiKey") else 6.5
+
+
+def _format_api_time(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def fetch_api_delta(
+    crawler: Crawler,
+    since: datetime,
+    until: datetime,
+    budget_seconds: float = API_DELTA_BUDGET_SECONDS,
+) -> list[dict]:
+    """Every CVE the API reports modified in [since, until], or raise.
+
+    All or nothing: a partial delta raises rather than returning short, so
+    the caller can say truthfully how current the published data is. Raises
+    ApiDeadlineError when the budget runs out, RuntimeError on anything else.
+    """
+    if until - since > timedelta(days=API_MAX_WINDOW_DAYS):
+        raise RuntimeError(
+            f"delta window {since.isoformat()}..{until.isoformat()} exceeds the "
+            f"API's {API_MAX_WINDOW_DAYS}-day limit"
+        )
+    deadline = time.monotonic() + budget_seconds
+    params = {
+        "lastModStartDate": _format_api_time(since),
+        "lastModEndDate": _format_api_time(until),
+        "resultsPerPage": PAGE_SIZE,
+    }
+    results: list[dict] = []
+    total: int | None = None
+    while total is None or len(results) < total:
+        page_params = dict(params, startIndex=len(results))
+        data = _fetch_api_page_bounded(
+            crawler,
+            NVD_API_BASE,
+            page_params,
+            f"API delta offset={len(results)}",
+            deadline,
+        )
+        if total is None:
+            try:
+                total = int(data["totalResults"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError("API delta response has no usable totalResults") from exc
+        page = data.get("vulnerabilities")
+        if not isinstance(page, list):
+            raise RuntimeError("API delta response has no vulnerabilities array")
+        for item in page:
+            if not isinstance(item, dict) or not (item.get("cve") or {}).get("id"):
+                raise RuntimeError("API delta returned a record without a CVE id")
+        if not page and len(results) < total:
+            raise RuntimeError(
+                f"API delta stopped at {len(results)} of {total} records"
+            )
+        results.extend(page)
+        if len(results) < total:
+            time.sleep(_api_page_delay(crawler))
+    return results
+
+
+def apply_api_delta(
+    crawler: Crawler,
+    overrides: dict[str, dict],
+    since: datetime,
+    until: datetime | None = None,
+    budget_seconds: float = API_DELTA_BUDGET_SECONDS,
+) -> dict:
+    """Overlay the API's recent changes onto `overrides`; never raises.
+
+    Returns a report for metadata.json. On failure `overrides` is untouched
+    and the run publishes exactly what it would have without the delta.
+    """
+    until = until or datetime.now(timezone.utc)
+    report = {"since": since.isoformat(), "until": until.isoformat()}
+    started = time.monotonic()
+    try:
+        records = fetch_api_delta(crawler, since, until, budget_seconds)
+    except (RuntimeError, requests.RequestException, ValueError) as exc:
+        log.warning("API delta skipped, publishing feed data only: %s", exc)
+        report.update(status="failed", error=str(exc)[:300])
+        return report
+    applied = 0
+    for item in records:
+        cve_id = cve_id_for_item(item)
+        current = overrides.get(cve_id)
+        if current is None or is_newer_record(item, current):
+            overrides[cve_id] = item
+            applied += 1
+    log.info(
+        "API delta %s..%s: %s records, %s applied in %.1fs",
+        report["since"], report["until"], len(records), applied,
+        time.monotonic() - started,
+    )
+    report.update(status="ok", records=len(records), applied=applied)
+    return report
+
+
+def fetch_total(crawler: Crawler, budget_seconds: float = API_TOTAL_BUDGET_SECONDS) -> int | None:
     """Return the API's reported total CVE count, or None if unavailable.
 
-    Used only as a completeness sanity check; never fatal on its own.
+    Used only as a completeness sanity check; never fatal on its own, and
+    bounded so that a dead API costs a minute rather than half an hour.
     """
-    url = f"{NVD_API_BASE}?resultsPerPage=1&startIndex=0"
     try:
-        data = _fetch_api_page(crawler, url, "totalResults probe")
+        data = _fetch_api_page_bounded(
+            crawler,
+            NVD_API_BASE,
+            {"resultsPerPage": 1, "startIndex": 0},
+            "totalResults probe",
+            time.monotonic() + budget_seconds,
+        )
         return int(data.get("totalResults", 0))
     except (RuntimeError, ValueError, TypeError):
         return None
@@ -715,15 +943,32 @@ def iter_feeds(
     crawler: Crawler,
     start_year: int,
     end_year: int,
-    override_ids: set[str] | None = None,
+    overrides: dict[str, dict] | None = None,
     request_delay_seconds: float = 0.0,
 ):
-    override_ids = override_ids or set()
+    """Yield each year feed's records, minus any CVE held in `overrides`.
+
+    An overridden CVE is emitted once, from `overrides`, at the end -- but
+    the overlay copy is not automatically the newer one. Year feeds rebuild at
+    03:00 ET while the modified feed sits on its 01:00 build until 06:00, so
+    for three runs a day a record changed in between is newer in its year
+    feed. When the year copy is strictly newer it replaces the override in
+    place, instead of being reverted to the older overlay copy.
+    """
+    overrides = overrides if overrides is not None else {}
     years = list(iter_feed_years(start_year, end_year))
     for index, year in enumerate(years):
         page = fetch_feed(crawler, year)
-        if override_ids:
-            page = [item for item in page if cve_id_for_item(item) not in override_ids]
+        if overrides:
+            kept = []
+            for item in page:
+                cve_id = cve_id_for_item(item)
+                current = overrides.get(cve_id)
+                if current is None:
+                    kept.append(item)
+                elif is_newer_record(item, current):
+                    overrides[cve_id] = item
+            page = kept
         yield page
 
         if request_delay_seconds > 0 and index < len(years) - 1:
@@ -747,13 +992,11 @@ def iter_all_pages(
     overrides: dict[str, dict],
     request_delay_seconds: float = 0.0,
 ):
-    override_ids = set(overrides)
-
     yield from iter_feeds(
         crawler,
         start_year,
         end_year,
-        override_ids=override_ids,
+        overrides=overrides,
         request_delay_seconds=request_delay_seconds,
     )
 
@@ -821,6 +1064,8 @@ def write_metadata(
     data_bytes: int | None = None,
     data_sha256: str | None = None,
     feed_timestamps: dict[str, str] | None = None,
+    data_current_through: str | None = None,
+    api_delta: dict | None = None,
 ) -> None:
     completeness_ratio = None
     if expected_total:
@@ -846,6 +1091,13 @@ def write_metadata(
         # CDN edge handing back an older build -- valid JSON, hundreds of CVEs
         # short -- before it has fetched the rest of the corpus.
         "feed_timestamps": dict(sorted((feed_timestamps or {}).items())),
+        # UTC instant up to which every NVD change is in this snapshot: the
+        # end of the API delta when it ran, otherwise the newest change in the
+        # modified feed. This, not last_run_iso, is how stale the data is.
+        "data_current_through": data_current_through,
+        # How the API delta went ("ok", "failed", "disabled"). "failed" is
+        # not degraded -- it means feed-only, the pre-delta behaviour.
+        "api_delta": api_delta or {"status": "disabled"},
         # Companion-manifest fields. Together with cve_count and year_counts
         # these let a consumer fetch ~2 KB, decide whether the 1.7 GB object is
         # worth downloading, and verify it end to end once it has.
@@ -963,6 +1215,10 @@ def main() -> int:
         os.environ.get("NVD_FEED_END_YEAR", str(datetime.now(timezone.utc).year))
     )
     include_modified_overlay = os.environ.get("NVD_INCLUDE_MODIFIED_OVERLAY", "1") != "0"
+    include_api_delta = os.environ.get("NVD_INCLUDE_API_DELTA", "1") != "0"
+    api_delta_budget = float(
+        os.environ.get("NVD_API_DELTA_BUDGET_SECONDS", str(API_DELTA_BUDGET_SECONDS))
+    )
 
     if start_year > end_year:
         log.error("Invalid feed year range: %s > %s", start_year, end_year)
@@ -1062,6 +1318,36 @@ def main() -> int:
                 log.error("Aborting: refusing to publish without the leading edge")
                 return 7
 
+        # How current the data is, before any delta: the newest change the
+        # modified feed carries. Taken now, before the year feeds can lift
+        # individual overrides past it, because a newer year-feed record says
+        # nothing about the changes around it.
+        feed_high_water = newest_last_modified(overrides.values())
+        data_current_through = feed_high_water.isoformat() if feed_high_water else None
+        api_delta_report: dict = {"status": "disabled"}
+        # The delta joins the overlay BEFORE the year feeds, not after. Year
+        # pages are streamed to disk as they land, so a CVE the delta brought
+        # in afterwards would already be written in its older year-feed copy,
+        # and the writer's keep-first dedup would then drop the newer one.
+        # Merging first lets iter_feeds' newer-wins rule settle every
+        # collision. The cost is the crawl time in freshness, which
+        # data_current_through reports honestly.
+        if include_api_delta and overrides:
+            if feed_high_water is None:
+                api_delta_report = {
+                    "status": "failed",
+                    "error": "modified feed has no readable lastModified to start from",
+                }
+            else:
+                api_delta_report = apply_api_delta(
+                    crawler,
+                    overrides,
+                    feed_high_water - API_DELTA_OVERLAP,
+                    budget_seconds=api_delta_budget,
+                )
+                if api_delta_report["status"] == "ok":
+                    data_current_through = api_delta_report["until"]
+
         year_counts: dict[int, int] = {}
         cve_count = write_stream(
             iter_all_pages(
@@ -1157,7 +1443,18 @@ def main() -> int:
         data_bytes=data_bytes,
         data_sha256=data_sha256,
         feed_timestamps=crawler.feed_timestamps,
+        data_current_through=data_current_through,
+        api_delta=api_delta_report,
     )
+
+    if api_delta_report["status"] == "failed" and os.environ.get("GITHUB_ACTIONS") == "true":
+        # Non-fatal by design, which also makes it easy to miss: surface it on
+        # the run summary rather than only in the log.
+        print(
+            "::warning title=API delta skipped::Published feed data only "
+            f"(current through {data_current_through}): "
+            f"{api_delta_report.get('error', 'unknown error')}"
+        )
 
     if crawler.years_via_api:
         log.warning(
