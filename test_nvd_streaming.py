@@ -672,13 +672,40 @@ def _dated_feed(timestamp, count, year=2026):
     return payload
 
 
-def test_feed_build_timestamp_parses_nist_format_as_utc():
-    # NIST writes seven fractional digits and no offset; the field is UTC.
-    built = nvd.feed_build_timestamp({"timestamp": "2026-09-11T03:00:01.8043137"})
+def test_feed_build_timestamp_reads_nist_format_as_us_eastern():
+    """Observed 2026-10-05: the modified feed's `timestamp` read 06:00:03
+    while its .meta said 06:00:05-04:00 and Last-Modified said 10:00:09 GMT.
+    Seven fractional digits, no offset, and local time -- not UTC."""
+    built = nvd.feed_build_timestamp({"timestamp": "2026-10-05T06:00:03.8524237"})
 
     assert built is not None
-    assert built.utcoffset().total_seconds() == 0
-    assert (built.year, built.month, built.day, built.hour) == (2026, 9, 11, 3)
+    assert built.utcoffset().total_seconds() == 0  # normalised to UTC
+    assert (built.month, built.day, built.hour) == (10, 5, 10)
+
+
+def test_feed_build_timestamp_follows_daylight_saving():
+    winter = nvd.feed_build_timestamp({"timestamp": "2026-12-01T03:00:01"})
+
+    assert winter.hour == 8  # EST is UTC-5
+
+
+def test_feed_build_timestamp_keeps_an_explicit_offset():
+    # Published manifests carry offsets; those must not be re-interpreted.
+    built = nvd.feed_build_timestamp({"timestamp": "2026-09-11T03:00:01+00:00"})
+
+    assert built.hour == 3
+
+
+def test_a_manifest_from_before_the_timezone_fix_never_makes_a_build_stale():
+    """Old manifests labelled Eastern wall-clock time +00:00, 4-5 hours early.
+    The first run after the fix compares a correctly parsed build against one
+    of those, and the error can only fall on the side of accepting it."""
+    legacy = nvd.baseline_feed_timestamps(
+        {"feed_timestamps": {"modified": "2026-10-05T06:00:03.852423+00:00"}}
+    )["modified"]
+
+    # The very same build, now read correctly.
+    nvd.assert_feed_fresh({"timestamp": "2026-10-05T06:00:03.8524237"}, legacy)
 
 
 def test_feed_build_timestamp_returns_none_when_unusable():
@@ -762,7 +789,7 @@ def test_stale_feed_fails_over_to_the_other_host():
     # The stale host was tried first and skipped, not silently accepted.
     assert crawler.session.requested == [stale, fresh]
     # And the accepted build is what gets published for the next run to use.
-    assert crawler.feed_timestamps["2026"].startswith("2026-09-11T03:00:01")
+    assert crawler.feed_timestamps["2026"].startswith("2026-09-11T07:00:01")
     assert crawler.years_via_api == []
 
 
@@ -801,7 +828,7 @@ def test_modified_feed_is_freshness_checked_too():
     )
 
     assert len(nvd.fetch_modified_feed(crawler)) == 7205
-    assert crawler.feed_timestamps["modified"].startswith("2026-09-11T13:00:00")
+    assert crawler.feed_timestamps["modified"].startswith("2026-09-11T17:00:00")
 
 
 def test_fetch_feed_passes_both_the_floor_and_the_freshness_reference():
@@ -941,3 +968,340 @@ def test_missing_baseline_aborts_before_the_scrape(monkeypatch):
     monkeypatch.setattr(nvd, "write_stream", explode)
 
     assert nvd.main() == 8
+
+
+# --- Overlay precedence -------------------------------------------------------
+#
+# Year feeds rebuild at 03:00 ET; the modified feed sits on its 01:00 build
+# until 06:00. A record changed in between is newer in its year feed, and the
+# overlay used to revert it to the older modified-feed copy for three runs a
+# day.
+
+
+def _rec(cve_id, last_modified, **extra):
+    return {"cve": {"id": cve_id, "lastModified": last_modified, **extra}}
+
+
+def test_a_newer_year_feed_record_beats_the_overlay(monkeypatch):
+    monkeypatch.setattr(
+        nvd,
+        "fetch_feed",
+        lambda crawler, year: [
+            _rec("CVE-2026-0001", "2026-10-05T06:30:00.000", src="year"),
+            _rec("CVE-2026-0002", "2026-10-04T00:00:00.000", src="year"),
+        ],
+    )
+    overrides = {
+        "CVE-2026-0001": _rec("CVE-2026-0001", "2026-10-05T05:00:00.000", src="modified"),
+        "CVE-2026-0002": _rec("CVE-2026-0002", "2026-10-05T05:00:00.000", src="modified"),
+    }
+
+    pages = list(nvd.iter_all_pages(Mock(), 2026, 2026, overrides))
+
+    # Each CVE is emitted exactly once, from the overlay page...
+    assert pages[0] == []
+    by_id = {item["cve"]["id"]: item["cve"]["src"] for item in pages[1]}
+    # ...carrying whichever copy is newer.
+    assert by_id == {"CVE-2026-0001": "year", "CVE-2026-0002": "modified"}
+
+
+def test_an_unreadable_last_modified_never_wins():
+    good = _rec("CVE-2026-0001", "2026-10-05T05:00:00.000")
+    bad = _rec("CVE-2026-0001", "garbage")
+
+    assert not nvd.is_newer_record(bad, good)
+    assert nvd.is_newer_record(good, bad)
+
+
+def test_a_delta_record_for_a_cve_only_in_its_year_feed_is_not_lost(monkeypatch, tmp_path):
+    """Found in a live run: when the delta merged after the year pages were
+    already on disk, a CVE absent from the modified feed was written in its
+    older year-feed copy and the writer's keep-first dedup dropped the newer
+    API copy. The delta now merges first, so the year feed defers to it."""
+    monkeypatch.setattr(
+        nvd,
+        "fetch_feed",
+        lambda crawler, year: [_rec("CVE-2026-0007", "2026-10-05T07:00:00.000", v="year")],
+    )
+    overrides = {"CVE-2026-0007": _rec("CVE-2026-0007", "2026-10-05T11:00:00.000", v="api")}
+    out = tmp_path / "nvd.json"
+
+    nvd.write_stream(nvd.iter_all_pages(Mock(), 2026, 2026, overrides), str(out))
+
+    assert [item["cve"]["v"] for item in json.loads(out.read_text())] == ["api"]
+
+
+# --- API delta ----------------------------------------------------------------
+#
+# The API once left this pipeline with weeks of runs that never finished. The
+# delta exists for freshness only, so it must be bounded in wall-clock time and
+# must never fail a run.
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class _ApiResponse:
+    def __init__(self, payload, status=200):
+        self.status_code = status
+        self.headers = {"Content-Type": "application/json"}
+        self._payload = payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+    def json(self):
+        return self._payload
+
+
+class _ApiSession:
+    """Serves API pages by startIndex, or runs `behaviour` per request."""
+
+    def __init__(self, records=None, behaviour=None, clock=None, total=None):
+        self.headers = {"apiKey": "k"}
+        self.records = records or []
+        self.total = len(self.records) if total is None else total
+        self.behaviour = behaviour
+        self.clock = clock
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append({"params": params, "timeout": timeout})
+        if self.behaviour:
+            return self.behaviour(self, params, timeout)
+        start = params["startIndex"]
+        size = params["resultsPerPage"]
+        return _ApiResponse(
+            {"totalResults": self.total, "vulnerabilities": self.records[start:start + size]}
+        )
+
+
+def _api_crawler(session):
+    return nvd.Crawler(session=session, user_agents=list(nvd.DEFAULT_USER_AGENTS))
+
+
+def _use_clock(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(nvd.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(nvd.time, "sleep", clock.sleep)
+    return clock
+
+
+_SINCE = nvd.datetime(2026, 10, 5, 9, 2, tzinfo=nvd.timezone.utc)
+_UNTIL = nvd.datetime(2026, 10, 5, 11, 23, tzinfo=nvd.timezone.utc)
+
+
+def test_api_delta_pages_through_a_lastmod_window(monkeypatch):
+    _use_clock(monkeypatch)
+    monkeypatch.setattr(nvd, "PAGE_SIZE", 2)
+    records = [_rec(f"CVE-2026-000{i}", "2026-10-05T10:00:00.000") for i in range(5)]
+    session = _ApiSession(records)
+
+    got = nvd.fetch_api_delta(_api_crawler(session), _SINCE, _UNTIL)
+
+    assert got == records
+    assert [c["params"]["startIndex"] for c in session.calls] == [0, 2, 4]
+    assert session.calls[0]["params"]["lastModStartDate"] == "2026-10-05T09:02:00.000Z"
+    assert session.calls[0]["params"]["lastModEndDate"] == "2026-10-05T11:23:00.000Z"
+
+
+def test_api_delta_is_all_or_nothing(monkeypatch):
+    _use_clock(monkeypatch)
+    # The API claims 3 records but the second page comes back empty.
+    session = _ApiSession([_rec("CVE-2026-0001", "2026-10-05T10:00:00.000")], total=3)
+
+    try:
+        nvd.fetch_api_delta(_api_crawler(session), _SINCE, _UNTIL)
+    except RuntimeError as exc:
+        assert "1 of 3" in str(exc)
+    else:
+        raise AssertionError("a short delta must not be returned as if complete")
+
+
+def test_a_dead_api_costs_the_budget_and_no_more(monkeypatch):
+    """The failure that drove this pipeline off the API: requests that hang
+    or fail forever. Every timeout and backoff is clipped to the budget."""
+    clock = _use_clock(monkeypatch)
+    import requests
+
+    def hang(session, params, timeout):
+        clock.now += timeout  # burns the whole request timeout, then fails
+        raise requests.ReadTimeout("read timed out")
+
+    session = _ApiSession(behaviour=hang, clock=clock)
+    start = clock.now
+
+    try:
+        nvd.fetch_api_delta(_api_crawler(session), _SINCE, _UNTIL, budget_seconds=300)
+    except nvd.ApiDeadlineError:
+        pass
+    else:
+        raise AssertionError("expected the budget to run out")
+
+    assert clock.now - start <= 300
+    assert all(c["timeout"] <= nvd.API_DELTA_REQUEST_TIMEOUT for c in session.calls)
+
+
+def test_api_delta_retries_a_transient_error(monkeypatch):
+    _use_clock(monkeypatch)
+    record = _rec("CVE-2026-0001", "2026-10-05T10:00:00.000")
+    replies = [_ApiResponse({}, status=503), _ApiResponse({"totalResults": 1, "vulnerabilities": [record]})]
+    session = _ApiSession(behaviour=lambda s, p, t: replies.pop(0))
+
+    assert nvd.fetch_api_delta(_api_crawler(session), _SINCE, _UNTIL) == [record]
+
+
+def test_api_delta_refuses_a_window_past_the_api_limit():
+    try:
+        nvd.fetch_api_delta(
+            _api_crawler(_ApiSession()), _UNTIL - nvd.timedelta(days=121), _UNTIL
+        )
+    except RuntimeError as exc:
+        assert "120-day" in str(exc)
+    else:
+        raise AssertionError("expected the 120-day limit to be enforced")
+
+
+def test_apply_api_delta_keeps_only_newer_records_and_adds_new_cves(monkeypatch):
+    _use_clock(monkeypatch)
+    overrides = {
+        "CVE-2026-0001": _rec("CVE-2026-0001", "2026-10-05T09:00:00.000", v=1),
+        "CVE-2026-0002": _rec("CVE-2026-0002", "2026-10-05T11:00:00.000", v=1),
+    }
+    session = _ApiSession(
+        [
+            _rec("CVE-2026-0001", "2026-10-05T10:00:00.000", v=2),
+            # Overlap re-reads: an older copy must not win.
+            _rec("CVE-2026-0002", "2026-10-05T09:30:00.000", v=0),
+            _rec("CVE-2026-0003", "2026-10-05T11:10:00.000", v=1),
+        ]
+    )
+
+    report = nvd.apply_api_delta(_api_crawler(session), overrides, _SINCE, _UNTIL)
+
+    assert report["status"] == "ok"
+    assert (report["records"], report["applied"]) == (3, 2)
+    assert {k: v["cve"]["v"] for k, v in overrides.items()} == {
+        "CVE-2026-0001": 2,
+        "CVE-2026-0002": 1,
+        "CVE-2026-0003": 1,
+    }
+
+
+def test_a_failed_api_delta_leaves_the_overlay_untouched(monkeypatch):
+    _use_clock(monkeypatch)
+    overrides = {"CVE-2026-0001": _rec("CVE-2026-0001", "2026-10-05T09:00:00.000")}
+    before = json.dumps(overrides, sort_keys=True)
+    session = _ApiSession(behaviour=lambda s, p, t: _ApiResponse({}, status=503))
+
+    report = nvd.apply_api_delta(_api_crawler(session), overrides, _SINCE, _UNTIL, budget_seconds=30)
+
+    assert report["status"] == "failed"
+    assert "503" in report["error"] or "out of time" in report["error"]
+    assert json.dumps(overrides, sort_keys=True) == before
+
+
+def test_fetch_total_is_bounded(monkeypatch):
+    clock = _use_clock(monkeypatch)
+    session = _ApiSession(behaviour=lambda s, p, t: _ApiResponse({}, status=503))
+    start = clock.now
+
+    assert nvd.fetch_total(_api_crawler(session)) is None
+    assert clock.now - start <= nvd.API_TOTAL_BUDGET_SECONDS
+
+
+# --- End to end through main() ------------------------------------------------
+
+
+def _run_main(monkeypatch, tmp_path, delta):
+    for var in (
+        "NVD_ALLOW_MISSING_BASELINE",
+        "NVD_SKIP_FEED_FRESHNESS",
+        "NVD_FEED_START_YEAR",
+        "NVD_FEED_END_YEAR",
+        "NVD_INCLUDE_API_DELTA",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("NVD_REQUEST_DELAY_SECONDS", "0")
+    monkeypatch.chdir(tmp_path)
+    current_year = nvd.datetime.now(nvd.timezone.utc).year
+    years = range(1999, current_year + 1)
+    monkeypatch.setattr(
+        nvd,
+        "fetch_baseline_metadata",
+        lambda *a, **k: {"cve_count": len(years), "year_counts": {str(y): 1 for y in years}},
+    )
+    monkeypatch.setattr(
+        nvd,
+        "fetch_modified_overrides",
+        lambda crawler: {
+            f"CVE-{current_year}-0001": _rec(f"CVE-{current_year}-0001", f"{current_year}-01-01T09:00:00.000")
+        },
+    )
+    monkeypatch.setattr(
+        nvd,
+        "fetch_feed",
+        lambda crawler, year: (
+            [_rec(f"CVE-{y}-0001", f"{y}-01-01T00:00:00.000") for y in range(1999, 2003)]
+            if year == 2002
+            else [_rec(f"CVE-{year}-0001", f"{year}-01-01T00:00:00.000")]
+        ),
+    )
+    monkeypatch.setattr(nvd, "fetch_api_delta", delta)
+    monkeypatch.setattr(nvd, "fetch_total", lambda crawler: None)
+
+    code = nvd.main()
+    meta = json.loads((tmp_path / "metadata.json").read_text()) if code == 0 else None
+    return code, meta
+
+
+def test_main_publishes_the_api_delta_and_says_how_current_it_is(monkeypatch, tmp_path):
+    seen = {}
+    year = nvd.datetime.now(nvd.timezone.utc).year
+
+    def delta(crawler, since, until, budget_seconds):
+        seen["since"] = since
+        return [
+            _rec(f"CVE-{year}-9999", f"{year}-01-01T10:00:00.000"),
+            # In the year feed but not the modified feed: the newer copy wins.
+            _rec(f"CVE-{year - 1}-0001", f"{year}-01-01T10:00:00.000", v="api"),
+        ]
+
+    code, meta = _run_main(monkeypatch, tmp_path, delta)
+
+    assert code == 0
+    # Starts one overlap before the modified feed's newest change.
+    assert seen["since"] == nvd.datetime(year, 1, 1, 9, tzinfo=nvd.timezone.utc) - nvd.API_DELTA_OVERLAP
+    assert meta["api_delta"]["status"] == "ok"
+    assert meta["data_current_through"] == meta["api_delta"]["until"]
+    data = json.loads((tmp_path / "nvd.json").read_text())
+    by_id = {item["cve"]["id"]: item["cve"] for item in data}
+    assert f"CVE-{year}-9999" in by_id
+    assert by_id[f"CVE-{year - 1}-0001"].get("v") == "api"
+    assert len(data) == len(by_id)  # no duplicates written
+
+
+def test_main_still_publishes_when_the_api_delta_fails(monkeypatch, tmp_path):
+    year = nvd.datetime.now(nvd.timezone.utc).year
+
+    def delta(crawler, since, until, budget_seconds):
+        raise nvd.ApiDeadlineError("out of time")
+
+    code, meta = _run_main(monkeypatch, tmp_path, delta)
+
+    assert code == 0
+    assert meta["api_delta"]["status"] == "failed"
+    assert meta["degraded"] is False
+    # Honest about freshness: the modified feed's newest change, not the run clock.
+    assert meta["data_current_through"] == f"{year}-01-01T09:00:00+00:00"

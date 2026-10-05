@@ -1,7 +1,7 @@
 # nvd-scrape-trigger
 
-Cloudflare Worker whose cron (`38 * * * *`, UTC) calls GitHub's
-`workflow_dispatch` API for `.github/workflows/scrape.yml`. It is the hourly
+Cloudflare Worker whose cron (`8,38 * * * *`, UTC) calls GitHub's
+`workflow_dispatch` API for `.github/workflows/scrape.yml`. It is the half-hourly
 trigger for the scrape; GitHub's own cron is only a daily fallback.
 
 ## Token
