@@ -99,6 +99,145 @@ def test_iter_all_pages_replaces_overridden_cves(monkeypatch):
     assert pages[2] == list(overrides.values())
 
 
+# --- parallel feed downloads ------------------------------------------------
+#
+# 2026-10-21, run 39627460775: resumable downloads rode out 40 dropped
+# connections, but at ~22 KB/s per connection both 80-minute attempts timed
+# out at 2019. NIST limits per connection, so feeds now download in parallel.
+
+
+def test_prefetch_yields_in_order_when_later_items_finish_first():
+    import threading
+
+    release = {i: threading.Event() for i in range(4)}
+
+    def fn(i):
+        release[i].wait(5)
+        return i * 10
+
+    # Let them finish in reverse order.
+    def unblock():
+        for i in (3, 2, 1, 0):
+            release[i].set()
+
+    threading.Timer(0.05, unblock).start()
+
+    assert list(nvd.iter_in_order_prefetched(fn, range(4), workers=4)) == [0, 10, 20, 30]
+
+
+def test_prefetch_runs_in_parallel_but_never_more_than_workers_ahead():
+    import threading
+    import time as real_time
+
+    lock = threading.Lock()
+    state = {"active": 0, "peak": 0}
+
+    def fn(i):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        real_time.sleep(0.02)
+        with lock:
+            state["active"] -= 1
+        return i
+
+    started = []
+
+    def consume():
+        for value in nvd.iter_in_order_prefetched(fn, range(12), workers=3):
+            started.append(value)
+
+    consume()
+    assert started == list(range(12))
+    assert state["peak"] == 3
+
+
+def test_prefetch_lookahead_is_bounded_while_the_head_is_slow():
+    """Memory bound: a slow early year must not let every later feed get
+    downloaded and parsed into memory behind it."""
+    import threading
+
+    head = threading.Event()
+    begun = []
+    lock = threading.Lock()
+
+    def fn(i):
+        with lock:
+            begun.append(i)
+        if i == 0:
+            head.wait(5)
+        return i
+
+    import time as real_time
+
+    gen = nvd.iter_in_order_prefetched(fn, range(10), workers=2)
+    waiter = threading.Thread(target=lambda: begun.append(("first", next(gen))))
+    waiter.start()
+    real_time.sleep(0.2)  # item 1 finishes long before this; item 0 is stuck
+
+    with lock:
+        assert sorted(begun) == [0, 1]
+    head.set()
+    waiter.join(5)
+    assert ("first", 0) in begun
+    assert list(gen) == list(range(1, 10))
+
+
+def test_prefetch_raises_a_failure_at_its_own_turn():
+    def fn(i):
+        if i == 2:
+            raise RuntimeError("Feed fetch failed for year=2004")
+        return i
+
+    got = []
+    try:
+        for value in nvd.iter_in_order_prefetched(fn, range(5), workers=4):
+            got.append(value)
+    except RuntimeError as exc:
+        assert "2004" in str(exc)
+    else:
+        raise AssertionError("expected the failure to propagate")
+    assert got == [0, 1]
+
+
+def test_prefetch_starts_nothing_new_after_the_consumer_stops():
+    import threading
+    import time as real_time
+
+    begun = []
+    lock = threading.Lock()
+
+    def fn(i):
+        with lock:
+            begun.append(i)
+        real_time.sleep(0.01)
+        return i
+
+    gen = nvd.iter_in_order_prefetched(fn, range(50), workers=2)
+    next(gen)
+    gen.close()
+    real_time.sleep(0.1)
+    count = len(begun)
+    real_time.sleep(0.1)
+
+    assert len(begun) == count
+    assert count < 50
+
+
+def test_parallel_iter_feeds_keeps_year_order_and_newer_wins(monkeypatch):
+    def fetch(crawler, year):
+        return [_rec(f"CVE-{year}-0001", f"{year}-06-01T00:00:00.000", src="year")]
+
+    monkeypatch.setattr(nvd, "fetch_feed", fetch)
+    overrides = {"CVE-2010-0001": _rec("CVE-2010-0001", "2001-01-01T00:00:00.000", src="overlay")}
+
+    pages = list(nvd.iter_feeds(Mock(), 2002, 2020, overrides=overrides, workers=4))
+
+    years = [int(page[0]["cve"]["id"].split("-")[1]) for page in pages if page]
+    assert years == [y for y in range(2002, 2021) if y != 2010]
+    assert overrides["CVE-2010-0001"]["cve"]["src"] == "year"
+
+
 def test_year_from_cve_id():
     assert nvd.year_from_cve_id("CVE-1999-0001") == 1999
     assert nvd.year_from_cve_id("CVE-2026-12345") == 2026
