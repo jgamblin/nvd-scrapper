@@ -41,9 +41,11 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import gzip
 import zlib
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
@@ -105,6 +107,14 @@ FEED_MAX_BACKOFF_SECONDS = 240
 # Each resume has to make progress, so this bounds a crawl, not a stall.
 MAX_FEED_RESUMES = 25
 FEED_COPY_CHUNK_BYTES = 1024 * 1024
+# Year feeds download this many at a time. NIST appears to limit each
+# connection, not the client: on 2026-10-21 one connection got 21-60 KB/s
+# and four at once got about 267 KB/s combined. At ~22 KB/s the ~255 MB corpus needs
+# over three hours, so the first run with resumable downloads (39627460775)
+# resumed through 40 dropped connections without exhausting a single feed and
+# still timed out at 2019 on both 80-minute attempts. Four stays under the six
+# connections per host a browser opens; NVD_FEED_WORKERS overrides it.
+FEED_DOWNLOAD_WORKERS = 4
 # NVD's year files start at 2002, and that first file is not a single-year
 # partition: it holds every CVE-ID year up to and including 2002. Verified
 # 2026-08-27 -- nvdcve-2.0-2002.json.gz carried 6771 records spanning
@@ -1035,12 +1045,62 @@ def fetch_modified_feed(crawler: Crawler) -> list[dict]:
     return vulnerabilities
 
 
+def iter_in_order_prefetched(fn, items, workers: int):
+    """Yield fn(item) for each item, in order, computing up to `workers` ahead.
+
+    At most `workers` results are in flight or waiting to be consumed, so
+    memory stays at a few parsed feeds however far ahead the downloads get. An
+    exception surfaces when its item's turn comes, as it would sequentially.
+    Workers are daemon threads: when the consumer stops early, the ones still
+    downloading are abandoned rather than holding the process open through
+    their own retry ladders.
+    """
+    items = list(items)
+    futures: list[Future] = [Future() for _ in items]
+    slots = threading.Semaphore(max(1, workers))
+    stop = threading.Event()
+    claim_lock = threading.Lock()
+    claims = iter(range(len(items)))
+
+    def work() -> None:
+        while True:
+            slots.acquire()
+            if stop.is_set():
+                return
+            with claim_lock:
+                index = next(claims, None)
+            if index is None:
+                slots.release()
+                return
+            try:
+                futures[index].set_result(fn(items[index]))
+            except BaseException as exc:  # handed to the consumer, not lost
+                futures[index].set_exception(exc)
+
+    threads = [
+        threading.Thread(target=work, name=f"feed-{n}", daemon=True)
+        for n in range(max(1, min(workers, len(items))))
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        for future in futures:
+            result = future.result()
+            slots.release()
+            yield result
+    finally:
+        stop.set()
+        for _ in threads:
+            slots.release()
+
+
 def iter_feeds(
     crawler: Crawler,
     start_year: int,
     end_year: int,
     overrides: dict[str, dict] | None = None,
     request_delay_seconds: float = 0.0,
+    workers: int = 1,
 ):
     """Yield each year feed's records, minus any CVE held in `overrides`.
 
@@ -1050,11 +1110,27 @@ def iter_feeds(
     for three runs a day a record changed in between is newer in its year
     feed. When the year copy is strictly newer it replaces the override in
     place, instead of being reverted to the older overlay copy.
+
+    Feeds download `workers` at a time (see iter_in_order_prefetched) but are
+    merged and yielded strictly in year order, here on the caller's thread.
+    `request_delay_seconds` spaces out when downloads start.
     """
     overrides = overrides if overrides is not None else {}
     years = list(iter_feed_years(start_year, end_year))
-    for index, year in enumerate(years):
-        page = fetch_feed(crawler, year)
+    start_lock = threading.Lock()
+    next_start = [0.0]
+
+    def fetch(year: int) -> list[dict]:
+        if request_delay_seconds > 0:
+            with start_lock:
+                now = time.monotonic()
+                wait = next_start[0] - now
+                next_start[0] = max(now, next_start[0]) + request_delay_seconds
+            if wait > 0:
+                time.sleep(wait)
+        return fetch_feed(crawler, year)
+
+    for page in iter_in_order_prefetched(fetch, years, workers):
         if overrides:
             kept = []
             for item in page:
@@ -1066,9 +1142,6 @@ def iter_feeds(
                     overrides[cve_id] = item
             page = kept
         yield page
-
-        if request_delay_seconds > 0 and index < len(years) - 1:
-            time.sleep(request_delay_seconds)
 
 
 def fetch_modified_overrides(
@@ -1087,6 +1160,7 @@ def iter_all_pages(
     end_year: int,
     overrides: dict[str, dict],
     request_delay_seconds: float = 0.0,
+    workers: int = 1,
 ):
     yield from iter_feeds(
         crawler,
@@ -1094,6 +1168,7 @@ def iter_all_pages(
         end_year,
         overrides=overrides,
         request_delay_seconds=request_delay_seconds,
+        workers=workers,
     )
 
     if overrides:
@@ -1306,6 +1381,7 @@ def main() -> int:
     started_at = datetime.now(timezone.utc)
 
     request_delay_seconds = float(os.environ.get("NVD_REQUEST_DELAY_SECONDS", "3"))
+    feed_workers = int(os.environ.get("NVD_FEED_WORKERS", str(FEED_DOWNLOAD_WORKERS)))
     start_year = int(os.environ.get("NVD_FEED_START_YEAR", "2002"))
     end_year = int(
         os.environ.get("NVD_FEED_END_YEAR", str(datetime.now(timezone.utc).year))
@@ -1390,10 +1466,11 @@ def main() -> int:
     )
 
     log.info(
-        "Fetching NVD feeds for years %s-%s (api_fallback=%s)",
+        "Fetching NVD feeds for years %s-%s (api_fallback=%s, workers=%s)",
         start_year,
         end_year,
         allow_api_fallback,
+        1 if allow_api_fallback else feed_workers,
     )
 
     try:
@@ -1452,6 +1529,9 @@ def main() -> int:
                 end_year,
                 overrides,
                 request_delay_seconds=request_delay_seconds,
+                # The REST API fallback pages at the API's rate limit, which
+                # parallel years would multiply, so it keeps one at a time.
+                workers=1 if allow_api_fallback else feed_workers,
             ),
             "nvd.json",
             year_counts=year_counts,
