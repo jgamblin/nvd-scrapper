@@ -17,9 +17,12 @@ Data path:
   3. An NVD REST API delta, overlaid last: every record modified since the
      newest change in the modified feed. NIST rebuilds that feed only every
      two hours by day and every five overnight, so without this the leading
-     edge lags NVD by up to six hours. Strictly bounded and never fatal -- the
-     API is unstable enough to have stalled this pipeline for weeks before --
-     so on any failure the run publishes the feed-only snapshot.
+     edge lags NVD by up to six hours. Strictly bounded and never fatal in
+     itself -- the API is unstable enough to have stalled this pipeline for
+     weeks before -- so on any failure the run falls back to the feed-only
+     snapshot. That snapshot still has to clear the coverage gate: if the
+     last published run's delta brought in CVEs the feeds do not have yet,
+     feed-only data is short of it and is not published.
   4. NVD REST API (services.nvd.nist.gov) -- a per-year fallback that is
      DISABLED for full-corpus runs. The API can only be queried by publication
      date while the feeds partition by CVE-ID year, so substituting it drops
@@ -37,8 +40,10 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import gzip
+import zlib
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
@@ -89,6 +94,17 @@ API_MAX_WINDOW_DAYS = 120
 MAX_FEED_RETRIES = 6
 FEED_BACKOFF_SECONDS = 15
 FEED_MAX_BACKOFF_SECONDS = 240
+# A feed download whose connection breaks mid-body resumes from the last byte
+# received instead of starting over. On 2026-10-21 nvd.nist.gov served CI at
+# roughly 30-60 KB/s and dropped connections anywhere from 0.2 MB to 23 MB in,
+# so the 37 MB 2026 feed never arrived in one piece: six whole-file attempts
+# each restarted at zero, and runs died on it or on the 80-minute step
+# timeout. The host answers Range with 206 and a stable ETag, and If-Range
+# makes a file rebuilt between two pieces come back whole (200) rather than
+# spliced onto the old build.
+# Each resume has to make progress, so this bounds a crawl, not a stall.
+MAX_FEED_RESUMES = 25
+FEED_COPY_CHUNK_BYTES = 1024 * 1024
 # NVD's year files start at 2002, and that first file is not a single-year
 # partition: it holds every CVE-ID year up to and including 2002. Verified
 # 2026-08-27 -- nvdcve-2.0-2002.json.gz carried 6771 records spanning
@@ -117,6 +133,15 @@ NIST_FEED_TZ = ZoneInfo("America/New_York")
 API_DELTA_BUDGET_SECONDS = 300
 API_DELTA_REQUEST_TIMEOUT = 60
 API_DELTA_BACKOFF_SECONDS = 5
+# The flat budget above only has to cover the first page, which proves the API
+# is answering. After that the deadline grows with the window's real size, up
+# to a hard cap. A fixed 300s fit the usual few-hundred-record delta but not the
+# one NIST produced by not rebuilding its feeds from 2026-10-16 to 10-21: about
+# 17k records (9 pages). One run fetched that in 241s; others were cut off at
+# offsets 12000-14000, threw the whole delta away, and then failed the
+# coverage gate because the snapshot they were measured against had it.
+API_DELTA_SECONDS_PER_PAGE = 60
+API_DELTA_MAX_BUDGET_SECONDS = 900
 # Re-read a little before the modified feed's newest change, so a record
 # written while NIST was building that feed cannot fall between the two.
 # Overlap is harmless: the newer lastModified wins either way.
@@ -536,6 +561,72 @@ def _log_request_error(label: str, attempt: int, max_attempts: int, url: str, ex
         log.warning("%s attempt %s/%s %s(%s): %s", label, attempt, max_attempts, type(exc).__name__, exc, url)
 
 
+class FeedBlockedError(RuntimeError):
+    """The feed host answered with what looks like a WAF block page."""
+
+
+def _content_range_start(value: str | None) -> int | None:
+    """First byte of a `bytes START-END/SIZE` Content-Range, or None."""
+    match = re.match(r"bytes (\d+)-\d+/(?:\d+|\*)$", (value or "").strip())
+    return int(match.group(1)) if match else None
+
+
+def _download_feed(crawler: Crawler, url: str, label: str, out) -> None:
+    """Copy `url`'s raw gzip bytes into `out`, resuming after a dropped connection.
+
+    Raises on anything that is not a clean, complete transfer. urllib3 enforces
+    Content-Length, so a body cut short raises here rather than leaving a
+    truncated file for the parser to find.
+    """
+    validator = None
+    resumes = 0
+    while True:
+        offset = out.tell()
+        headers = {}
+        if offset:
+            headers = {"Range": f"bytes={offset}-", "If-Range": validator}
+        try:
+            with crawler.session.get(
+                url, timeout=REQUEST_TIMEOUT, stream=True, headers=headers
+            ) as resp:
+                if looks_like_block(resp):
+                    rotated = crawler.rotate_user_agent()
+                    log.warning(
+                        "%s appears blocked (HTTP %s) on %s; rotated UA=%s",
+                        label, resp.status_code, url, rotated,
+                    )
+                    raise FeedBlockedError(f"blocked HTTP {resp.status_code}")
+                resp.raise_for_status()
+                if offset and resp.status_code == 206:
+                    start = _content_range_start(resp.headers.get("Content-Range"))
+                    if start != offset:
+                        raise ValueError(
+                            f"asked to resume at byte {offset}, got Content-Range "
+                            f"{resp.headers.get('Content-Range')!r}"
+                        )
+                elif offset:
+                    # Range ignored, or If-Range saw a new build: this is the
+                    # whole file from byte 0, so drop the partial copy.
+                    log.warning("%s resume refused (HTTP %s); restarting from byte 0", label, resp.status_code)
+                    out.seek(0)
+                    out.truncate()
+                validator = resp.headers.get("ETag") or resp.headers.get("Last-Modified")
+                resp.raw.decode_content = False
+                shutil.copyfileobj(resp.raw, out, FEED_COPY_CHUNK_BYTES)
+                return
+        except (OSError, requests.RequestException, urllib3.exceptions.HTTPError) as exc:
+            # Only a transfer that broke after making progress, on a response
+            # we can pin to one build, is worth resuming. Anything else is a
+            # failed fetch for the retry ladder and the host failover.
+            if not validator or out.tell() <= offset or resumes >= MAX_FEED_RESUMES:
+                raise
+            resumes += 1
+            log.warning(
+                "%s connection broke at byte %s (%s); resuming %s/%s",
+                label, out.tell(), type(exc).__name__, resumes, MAX_FEED_RESUMES,
+            )
+
+
 def _load_gzip_json_from_urls(
     crawler: Crawler,
     urls: list[str],
@@ -559,28 +650,27 @@ def _load_gzip_json_from_urls(
     for attempt in range(1, max_attempts + 1):
         for url in urls:
             try:
-                with crawler.session.get(url, timeout=REQUEST_TIMEOUT, stream=True) as resp:
-                    if looks_like_block(resp):
-                        rotated = crawler.rotate_user_agent()
-                        log.warning(
-                            "%s appears blocked (HTTP %s) on %s; rotated UA=%s",
-                            label, resp.status_code, url, rotated,
-                        )
-                        last_exc = RuntimeError(f"blocked HTTP {resp.status_code}")
-                        continue
-                    resp.raise_for_status()
-                    resp.raw.decode_content = False
-                    with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
+                # Downloaded to disk before parsing, not parsed off the socket,
+                # so that a dropped connection can resume (see _download_feed).
+                with tempfile.TemporaryFile() as raw_file:
+                    _download_feed(crawler, url, label, raw_file)
+                    raw_file.seek(0)
+                    with gzip.GzipFile(fileobj=raw_file) as gz_stream:
                         payload = json.load(gz_stream)
-                    # Inside the try on purpose: a feed that is truncated at
-                    # the source or replayed from an older build is a failed
-                    # fetch, so it belongs to the retry ladder and the host
-                    # failover, not to the caller as a thin success.
-                    assert_feed_intact(payload, min_records)
-                    assert_feed_fresh(payload, baseline_built_at)
-                    return payload
+                # Inside the try on purpose: a feed that is truncated at
+                # the source or replayed from an older build is a failed
+                # fetch, so it belongs to the retry ladder and the host
+                # failover, not to the caller as a thin success.
+                assert_feed_intact(payload, min_records)
+                assert_feed_fresh(payload, baseline_built_at)
+                return payload
+            except FeedBlockedError as exc:
+                last_exc = exc
+                continue
             except (
                 OSError,
+                EOFError,
+                zlib.error,
                 requests.RequestException,
                 ValueError,
                 urllib3.exceptions.HTTPError,
@@ -707,7 +797,8 @@ def fetch_api_delta(
             f"delta window {since.isoformat()}..{until.isoformat()} exceeds the "
             f"API's {API_MAX_WINDOW_DAYS}-day limit"
         )
-    deadline = time.monotonic() + budget_seconds
+    started = time.monotonic()
+    deadline = started + budget_seconds
     params = {
         "lastModStartDate": _format_api_time(since),
         "lastModEndDate": _format_api_time(until),
@@ -729,6 +820,11 @@ def fetch_api_delta(
                 total = int(data["totalResults"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError("API delta response has no usable totalResults") from exc
+            pages = -(-total // PAGE_SIZE)
+            deadline = max(
+                deadline,
+                started + min(pages * API_DELTA_SECONDS_PER_PAGE, API_DELTA_MAX_BUDGET_SECONDS),
+            )
         page = data.get("vulnerabilities")
         if not isinstance(page, list):
             raise RuntimeError("API delta response has no vulnerabilities array")
@@ -741,7 +837,7 @@ def fetch_api_delta(
             )
         results.extend(page)
         if len(results) < total:
-            time.sleep(_api_page_delay(crawler))
+            time.sleep(max(0.0, min(_api_page_delay(crawler), deadline - time.monotonic())))
     return results
 
 
@@ -1393,6 +1489,13 @@ def main() -> int:
         if problems:
             for problem in problems:
                 log.error("Per-year coverage check failed: %s", problem)
+            if api_delta_report["status"] == "failed":
+                log.error(
+                    "The API delta was skipped this run (%s). If the published "
+                    "snapshot carried one, the shortfall is CVEs only the API "
+                    "has so far, not records lost from the feeds.",
+                    api_delta_report.get("error", "unknown error"),
+                )
             log.error("Aborting: per-year coverage regressed -- not publishing partial data")
             return 6
         log.info(
