@@ -672,6 +672,162 @@ def _dated_feed(timestamp, count, year=2026):
     return payload
 
 
+# --- resumable feed downloads ----------------------------------------------
+#
+# 2026-10-21: nvd.nist.gov cut CI connections every few MB at well under
+# 100 KB/s. Each whole-file retry restarted at byte 0, so the 37 MB 2026 feed
+# never arrived and every run died on it or on the step timeout.
+
+
+def _gz(payload):
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        gz.write(json.dumps(payload).encode())
+    return buf.getvalue()
+
+
+class _BreakingRaw:
+    """Serves `data` up to `break_at`, then fails the way urllib3 does."""
+
+    decode_content = False
+
+    def __init__(self, data, break_at=None):
+        self.data = data
+        self.pos = 0
+        self.break_at = len(data) if break_at is None else break_at
+
+    def read(self, amt=-1):
+        if self.pos >= self.break_at and self.break_at < len(self.data):
+            import urllib3.exceptions
+
+            raise urllib3.exceptions.ProtocolError(
+                f"Connection broken: IncompleteRead({self.pos} bytes read, "
+                f"{len(self.data) - self.pos} more expected)"
+            )
+        end = self.break_at if amt is None or amt < 0 else min(self.pos + amt, self.break_at)
+        chunk = self.data[self.pos:end]
+        self.pos = end
+        return chunk
+
+
+class _RangeResponse:
+    def __init__(self, status, raw, headers):
+        self.status_code = status
+        self.raw = raw
+        self.headers = {"Content-Type": "application/gzip", **headers}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+class _RangeSession:
+    """A host that honours Range/If-Range and breaks at scripted offsets.
+
+    `bodies` is the file per request in order (a rebuild swaps it), and
+    `breaks` the absolute byte each response dies at (None = completes).
+    """
+
+    def __init__(self, bodies, breaks, etags=None, honour_range=True):
+        self.headers = {}
+        self.bodies = bodies
+        self.breaks = list(breaks)
+        self.etags = etags or ['"v1"'] * len(bodies)
+        self.honour_range = honour_range
+        self.calls = []
+
+    def get(self, url, headers=None, **kwargs):
+        n = len(self.calls)
+        headers = headers or {}
+        self.calls.append(dict(headers))
+        body, etag = self.bodies[n], self.etags[n]
+        brk = self.breaks[n]
+        rng = headers.get("Range")
+        if rng and self.honour_range and headers.get("If-Range") == etag:
+            start = int(rng.split("=")[1].rstrip("-"))
+            tail = body[start:]
+            raw = _BreakingRaw(tail, None if brk is None else brk - start)
+            return _RangeResponse(
+                206, raw, {"ETag": etag, "Content-Range": f"bytes {start}-{len(body) - 1}/{len(body)}"}
+            )
+        return _RangeResponse(200, _BreakingRaw(body, brk), {"ETag": etag})
+
+
+def _range_crawler(session):
+    return nvd.Crawler(session=session, user_agents=list(nvd.DEFAULT_USER_AGENTS))
+
+
+def test_a_dropped_feed_download_resumes_where_it_broke(monkeypatch):
+    monkeypatch.setattr(nvd, "FEED_COPY_CHUNK_BYTES", 64)
+    payload = _envelope(300, 300, year=2026)
+    body = _gz(payload)
+    session = _RangeSession([body] * 3, [len(body) // 3, 2 * len(body) // 3, None])
+    slept = []
+    monkeypatch.setattr(nvd.time, "sleep", slept.append)
+
+    got = nvd._load_gzip_json_from_urls(_range_crawler(session), ["https://nvd/x.json.gz"], "feed year=2026")
+
+    assert got == payload
+    assert session.calls[0] == {}
+    assert session.calls[1]["If-Range"] == '"v1"'
+    assert session.calls[1]["Range"].startswith("bytes=") and session.calls[1]["Range"] != "bytes=0-"
+    assert len(session.calls) == 3
+    assert slept == []  # resumed in place, never fell back to the retry ladder
+
+
+def test_a_feed_rebuilt_mid_download_is_not_spliced(monkeypatch):
+    """If-Range sees the new ETag, the host sends the whole new file (200),
+    and the partial old build is thrown away rather than prefixed to it."""
+    monkeypatch.setattr(nvd, "FEED_COPY_CHUNK_BYTES", 64)
+    old, new = _envelope(300, 300, year=2026), _envelope(310, 310, year=2026)
+    old_body, new_body = _gz(old), _gz(new)
+    session = _RangeSession([old_body, new_body], [len(old_body) // 2, None], etags=['"v1"', '"v2"'])
+
+    got = nvd._load_gzip_json_from_urls(_range_crawler(session), ["https://nvd/x.json.gz"], "feed year=2026")
+
+    assert got == new
+    assert session.calls[1]["If-Range"] == '"v1"'
+
+
+def test_a_break_with_no_progress_falls_to_the_retry_ladder(monkeypatch):
+    """Resuming is only for a transfer that moved. A connection that dies
+    before the first byte is an ordinary failed fetch."""
+    monkeypatch.setattr(nvd.time, "sleep", lambda s: None)
+    body = _gz(_envelope(10, 10, year=2026))
+    session = _RangeSession([body] * 2, [0, None])
+
+    got = nvd._load_gzip_json_from_urls(
+        _range_crawler(session), ["https://nvd/x.json.gz"], "feed year=2026", max_attempts=2
+    )
+
+    assert len(got["vulnerabilities"]) == 10
+    assert session.calls == [{}, {}]
+
+
+def test_feed_resumes_are_bounded(monkeypatch):
+    monkeypatch.setattr(nvd, "FEED_COPY_CHUNK_BYTES", 1)
+    monkeypatch.setattr(nvd, "MAX_FEED_RESUMES", 2)
+    body = _gz(_envelope(50, 50, year=2026))
+    # Every response moves one byte and dies.
+    session = _RangeSession([body] * 3, [1, 2, 3])
+
+    try:
+        nvd._download_feed(_range_crawler(session), "https://nvd/x.json.gz", "feed", io.BytesIO())
+    except Exception as exc:
+        assert "IncompleteRead" in str(exc)
+    else:
+        raise AssertionError("expected the resume budget to run out")
+    assert len(session.calls) == 3
+
+
 def test_feed_build_timestamp_reads_nist_format_as_us_eastern():
     """Observed 2026-10-05: the modified feed's `timestamp` read 06:00:03
     while its .meta said 06:00:05-04:00 and Last-Modified said 10:00:09 GMT.
@@ -1151,6 +1307,45 @@ def test_a_dead_api_costs_the_budget_and_no_more(monkeypatch):
 
     assert clock.now - start <= 300
     assert all(c["timeout"] <= nvd.API_DELTA_REQUEST_TIMEOUT for c in session.calls)
+
+
+def test_a_large_live_delta_gets_time_for_every_page(monkeypatch):
+    """2026-10-20: NIST had not rebuilt its feeds for four days, the delta was
+    ~17k records, and pages took ~45s. A flat 300s cut it off at offset
+    12000-14000; the budget now scales once the first page proves the API is up."""
+    clock = _use_clock(monkeypatch)
+    monkeypatch.setattr(nvd, "PAGE_SIZE", 2)
+    records = [_rec(f"CVE-2026-{i:04d}", "2026-10-05T10:00:00.000") for i in range(17)]
+
+    def slow(session, params, timeout):
+        clock.now += 45
+        start = params["startIndex"]
+        return _ApiResponse({"totalResults": 17, "vulnerabilities": records[start:start + 2]})
+
+    session = _ApiSession(behaviour=slow, clock=clock)
+
+    assert nvd.fetch_api_delta(_api_crawler(session), _SINCE, _UNTIL, budget_seconds=300) == records
+    assert len(session.calls) == 9
+
+
+def test_a_scaled_delta_budget_is_still_capped(monkeypatch):
+    clock = _use_clock(monkeypatch)
+    monkeypatch.setattr(nvd, "PAGE_SIZE", 1)
+    start = clock.now
+
+    def slow(session, params, timeout):
+        clock.now += min(50, timeout)  # a real request never outlives its timeout
+        return _ApiResponse({"totalResults": 1000, "vulnerabilities": [_rec("CVE-2026-0001", "2026-10-05T10:00:00.000")]})
+
+    session = _ApiSession(behaviour=slow, clock=clock)
+
+    try:
+        nvd.fetch_api_delta(_api_crawler(session), _SINCE, _UNTIL, budget_seconds=300)
+    except nvd.ApiDeadlineError:
+        pass
+    else:
+        raise AssertionError("expected the capped budget to run out")
+    assert clock.now - start <= nvd.API_DELTA_MAX_BUDGET_SECONDS
 
 
 def test_api_delta_retries_a_transient_error(monkeypatch):

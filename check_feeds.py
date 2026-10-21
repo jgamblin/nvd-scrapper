@@ -47,6 +47,7 @@ import traceback
 import zlib
 
 import requests
+import urllib3.exceptions
 
 import nvd
 
@@ -170,7 +171,12 @@ def check_modified_feed(crawler: nvd.Crawler) -> tuple[list[str], list[str]]:
                 with gzip.GzipFile(fileobj=resp.raw) as gz_stream:
                     payload = json.load(gz_stream)
         except (
-            OSError, EOFError, zlib.error, requests.RequestException, ValueError
+            OSError,
+            EOFError,
+            zlib.error,
+            requests.RequestException,
+            urllib3.exceptions.HTTPError,
+            ValueError,
         ) as exc:
             # Unreachable, 404 mid-regeneration, a truncated gzip stream: all
             # upstream weather the scraper's retry ladder is built to ride out,
@@ -178,7 +184,10 @@ def check_modified_feed(crawler: nvd.Crawler) -> tuple[list[str], list[str]]:
             # short) and zlib.error (a corrupt deflate stream) are listed
             # separately because neither is an OSError -- missing them let a
             # short read on 2026-09-23 crash the check, and the crash's exit
-            # code 1 was reported as NIST serving incomplete feeds.
+            # code 1 was reported as NIST serving incomplete feeds. A
+            # connection dropped mid-body surfaces from resp.raw as urllib3's
+            # ProtocolError, which requests never gets the chance to wrap;
+            # missing that crashed the check on 2026-10-21 (exit 2).
             notes.append(f"modified feed: not evaluated ({type(exc).__name__}: {exc})")
             continue
 

@@ -259,6 +259,47 @@ def test_a_truncated_gzip_stream_is_a_note_not_a_finding():
     assert any("EOFError" in n for n in notes)
 
 
+def test_a_connection_dropped_mid_body_is_a_note_not_a_finding():
+    """resp.raw raises urllib3's ProtocolError, not a requests exception, when
+    the server closes the connection early. On 2026-10-21 that escaped and
+    crashed the monitor while nvd.nist.gov was dropping CI connections."""
+    import urllib3.exceptions
+
+    class Raw:
+        decode_content = False
+
+        def read(self, *a, **k):
+            raise urllib3.exceptions.ProtocolError(
+                "Connection broken: IncompleteRead(5690595 bytes read, 9090714 more expected)"
+            )
+
+    class Resp:
+        status_code = 200
+        headers = {"Content-Type": "application/gzip"}
+        raw = Raw()
+
+        def raise_for_status(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    class Session:
+        headers: dict = {}
+
+        def get(self, url, **kwargs):
+            return Resp()
+
+    crawler = nvd.Crawler(session=Session(), user_agents=["ua"])
+    problems, notes = check_feeds.check_modified_feed(crawler)
+
+    assert problems == []
+    assert any("ProtocolError" in n for n in notes)
+
+
 def test_main_exits_2_when_the_check_itself_crashes(monkeypatch):
     """A crash would otherwise exit 1 and be filed as an upstream outage."""
     monkeypatch.setattr(check_feeds, "fetch_baseline_year_counts", lambda url: {2026: 1})
